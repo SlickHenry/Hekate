@@ -1,8 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,7 +23,6 @@ import (
 	"time"
 )
 
-// Configuration holds all the program configuration
 type Configuration struct {
 	APIBaseURL         string
 	IdentityURL        string
@@ -48,7 +49,6 @@ type Configuration struct {
 	ShowVersion        bool
 }
 
-// Enhanced FieldMapping with filtering and statistics
 type FieldMapping struct {
 	OrderedFields          []string                    `json:"ordered_fields"`
 	FieldMappings          map[string]string           `json:"field_mappings"`
@@ -61,30 +61,26 @@ type FieldMapping struct {
 	CEFVersion             string                      `json:"cef_version"`
 }
 
-// EventFilter holds comprehensive filtering configuration
 type EventFilter struct {
-	Mode               string                  `json:"mode"`                // "include", "exclude", or "all"
-	ExcludedEvents     []string                `json:"excluded_events"`     // Event types to exclude
-	IncludedEvents     []string                `json:"included_events"`     // Event types to include
-	RateLimiting       map[string]RateLimit    `json:"rate_limiting"`       // Rate limiting per event type
-	PriorityEvents     []string                `json:"priority_events"`     // Always include these events
-	UserFiltering      UserFilter              `json:"user_filtering"`      // User-based filtering
+	Mode               string                  `json:"mode"`
+	ExcludedEvents     []string                `json:"excluded_events"`
+	IncludedEvents     []string                `json:"included_events"`
+	RateLimiting       map[string]RateLimit    `json:"rate_limiting"`
+	PriorityEvents     []string                `json:"priority_events"`
+	UserFiltering      UserFilter              `json:"user_filtering"`
 }
 
-// RateLimit defines rate limiting rules for specific event types
 type RateLimit struct {
 	MaxPerHour int  `json:"max_per_hour"`
 	Enabled    bool `json:"enabled"`
 }
 
-// UserFilter defines user-based filtering rules  
 type UserFilter struct {
 	ExcludeServiceAccounts bool     `json:"exclude_service_accounts"`
 	ExcludeUsers          []string `json:"exclude_users"`
 	IncludeOnlyUsers      []string `json:"include_only_users"`
 }
 
-// StatisticsConfig controls statistics collection and reporting
 type StatisticsConfig struct {
 	EnableDetailedLogging   bool `json:"enable_detailed_logging"`
 	LogIntervalEvents       int  `json:"log_interval_events"`
@@ -92,13 +88,11 @@ type StatisticsConfig struct {
 	TrackPerformanceMetrics bool `json:"track_performance_metrics"`
 }
 
-// LookupConfig defines how to lookup and cache external data
 type LookupConfig struct {
 	Endpoint        string            `json:"endpoint"`
 	ResponseMapping map[string]string `json:"response_mapping"`
 }
 
-// ServiceStats tracks comprehensive service health metrics
 type ServiceStats struct {
 	sync.RWMutex
 	StartTime              time.Time
@@ -123,13 +117,11 @@ type ServiceStats struct {
 	AverageEventsPerSecond float64
 }
 
-// RateLimitTracker tracks rate limits per event type
 type RateLimitTracker struct {
 	sync.RWMutex
-	EventCounts map[string][]time.Time // event_type -> timestamps
+	EventCounts map[string][]time.Time
 }
 
-// OAuthToken represents an OAuth2 access token
 type OAuthToken struct {
 	AccessToken string    `json:"access_token"`
 	TokenType   string    `json:"token_type"`
@@ -137,22 +129,29 @@ type OAuthToken struct {
 	ExpiresAt   time.Time `json:"-"`
 }
 
-// BitwardenEvent represents a Bitwarden event
+// FIXED BitwardenEvent struct to match API response
 type BitwardenEvent struct {
-	ID           string                 `json:"id"`
-	Type         int                    `json:"type"`
-	Date         time.Time              `json:"date"`
-	MemberID     *string                `json:"memberId"`
-	ActingUserID *string                `json:"actingUserId"`
-	IPAddress    string                 `json:"ipAddress"`
-	Device       string                 `json:"device"`
-	GroupID      *string                `json:"groupId"`
-	CollectionID *string                `json:"collectionId"`
-	PolicyID     *int                   `json:"policyId"`
-	Object       string                 `json:"object"`
+	Object       string    `json:"object"`
+	Type         int       `json:"type"`
+	ItemID       *string   `json:"itemId"`
+	CollectionID *string   `json:"collectionId"`
+	GroupID      *string   `json:"groupId"`
+	PolicyID     *string   `json:"policyId"`
+	MemberID     *string   `json:"memberId"`
+	ActingUserID *string   `json:"actingUserId"`
+	InstallationID *string `json:"installationId"`
+	Date         time.Time `json:"date"`
+	Device       int       `json:"device"`
+	IPAddress    *string   `json:"ipAddress"`
+	ID           string    `json:"id"`
 }
 
-// SyslogWriter manages a resilient connection to a syslog server
+type BitwardenEventsResponse struct {
+	Object            string           `json:"object"`
+	Data              []BitwardenEvent `json:"data"`
+	ContinuationToken *string          `json:"continuationToken"`
+}
+
 type SyslogWriter struct {
 	protocol       string
 	address        string
@@ -163,13 +162,11 @@ type SyslogWriter struct {
 	reconnectDelay time.Duration
 }
 
-// Cache for lookup data
 type LookupCache struct {
 	sync.RWMutex
 	data map[string]map[string]interface{}
 }
 
-// Statistics structures for tracking
 type CacheStats struct {
 	Hits   int
 	Misses int
@@ -195,13 +192,11 @@ var (
 )
 
 func main() {
-	// Create cancellable context for graceful shutdown
 	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 
 	config := loadConfig()
 
-	// Handle special modes
 	if config.ShowVersion {
 		fmt.Println("Bitwarden Event Forwarder v2.0.0 - Enhanced with Filtering & Statistics")
 		return
@@ -223,24 +218,19 @@ func main() {
 		return
 	}
 
-	// Setup logging
 	if err := setupLogging(config); err != nil {
 		log.Fatalf("Failed to setup logging: %v", err)
 	}
 
-	// Log startup information
 	logServiceStartup(config)
 
-	// Validate configuration
 	if err := validateConfig(config); err != nil {
 		log.Fatalf("❌ Configuration validation failed: %v", err)
 	}
 
-	// Load field mappings and event types
 	fieldMapping := loadFieldMapping(config.FieldMapFile)
 	eventTypeMap = loadEventTypeMap(config.EventMapFile)
 
-	// Initialize syslog writer
 	syslogWriter, err := NewSyslogWriter(config.SyslogProtocol,
 		fmt.Sprintf("%s:%s", config.SyslogServer, config.SyslogPort), config)
 	if err != nil {
@@ -250,14 +240,12 @@ func main() {
 
 	log.Println("✅ Syslog connectivity verified")
 
-	// Authenticate with Bitwarden
 	if err := authenticateWithBitwarden(config); err != nil {
 		log.Fatalf("❌ Failed to authenticate with Bitwarden: %v", err)
 	}
 
 	log.Printf("✅ Successfully authenticated (expires: %s)", currentToken.ExpiresAt.Format("2006-01-02 15:04:05"))
 
-	// Initialize cache and load last marker
 	log.Println("💾 Cache initialized")
 	log.Printf("🗺️  Field mappings loaded (%d lookups)", len(fieldMapping.Lookups))
 	log.Printf("📝 Event types loaded (%d types)", len(eventTypeMap))
@@ -269,26 +257,22 @@ func main() {
 		log.Println("🆕 Starting fresh - will collect from oldest available events")
 	}
 
-	// Start health check server if configured
 	if config.HealthCheckPort > 0 {
 		go startHealthCheckServer(config.HealthCheckPort)
 		log.Printf("🏥 Health check server started on port %d", config.HealthCheckPort)
 	}
 
-	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
 
 	log.Println("🎯 Starting event polling...")
 
-	// Main service loop with exponential backoff on failures
 	ticker := time.NewTicker(time.Duration(config.FetchInterval) * time.Second)
 	defer ticker.Stop()
 
 	backoffDelay := 1 * time.Second
 	maxBackoff := time.Duration(config.MaxBackoffDelay) * time.Second
 
-	// Process initial events
 	processEventsWithRecovery(config, fieldMapping, syslogWriter, lastMarker)
 
 	for {
@@ -301,11 +285,9 @@ func main() {
 			success := processEventsWithRecovery(config, fieldMapping, syslogWriter, lastMarker)
 
 			if success {
-				// Reset backoff on success
 				backoffDelay = 1 * time.Second
 				ticker.Reset(time.Duration(config.FetchInterval) * time.Second)
 			} else {
-				// Apply exponential backoff on failure
 				log.Printf("⏰ Processing failed, backing off for %v", backoffDelay)
 				ticker.Reset(backoffDelay)
 				backoffDelay *= 2
@@ -333,7 +315,6 @@ func main() {
 }
 
 func loadConfig() Configuration {
-	// Command line flags
 	apiURL := flag.String("api-url", getEnvOrDefault("BW_API_URL", "https://api.bitwarden.com"), "Bitwarden API base URL")
 	identityURL := flag.String("identity-url", getEnvOrDefault("BW_IDENTITY_URL", "https://identity.bitwarden.com"), "Bitwarden Identity URL")
 	clientID := flag.String("client-id", getEnvOrDefault("BW_CLIENT_ID", ""), "Bitwarden API Client ID")
@@ -448,7 +429,6 @@ func logServiceStartup(config Configuration) {
 func runConnectionTests(config Configuration) error {
 	log.Println("🔍 Testing configuration and connections...")
 
-	// Test Bitwarden API authentication
 	log.Print("  Testing Bitwarden API authentication... ")
 	if err := authenticateWithBitwarden(config); err != nil {
 		log.Printf("❌ FAILED: %v", err)
@@ -456,7 +436,6 @@ func runConnectionTests(config Configuration) error {
 	}
 	log.Println("✅ SUCCESS")
 
-	// Test Bitwarden API connectivity
 	log.Print("  Testing Bitwarden API connectivity... ")
 	if err := testBitwardenAPI(config); err != nil {
 		log.Printf("❌ FAILED: %v", err)
@@ -464,7 +443,6 @@ func runConnectionTests(config Configuration) error {
 	}
 	log.Println("✅ SUCCESS")
 
-	// Test Syslog connectivity
 	log.Print("  Testing Syslog connectivity... ")
 	writer, err := NewSyslogWriter(config.SyslogProtocol, 
 		fmt.Sprintf("%s:%s", config.SyslogServer, config.SyslogPort), config)
@@ -475,7 +453,6 @@ func runConnectionTests(config Configuration) error {
 	writer.Close()
 	log.Println("✅ SUCCESS")
 
-	// Test configuration files
 	log.Print("  Testing configuration files... ")
 	if err := testConfigFiles(config); err != nil {
 		log.Printf("❌ FAILED: %v", err)
@@ -483,7 +460,6 @@ func runConnectionTests(config Configuration) error {
 	}
 	log.Println("✅ SUCCESS")
 
-	// Test file permissions
 	log.Print("  Testing file permissions... ")
 	if err := testFilePermissions(config); err != nil {
 		log.Printf("❌ FAILED: %v", err)
@@ -557,10 +533,16 @@ func (w *SyslogWriter) Reconnect() error {
 func authenticateWithBitwarden(config Configuration) error {
 	tokenURL := config.IdentityURL + "/connect/token"
 
-	data := fmt.Sprintf("grant_type=client_credentials&scope=api.organization&client_id=%s&client_secret=%s",
-		config.ClientID, config.ClientSecret)
+	deviceInfo := url.Values{}
+	deviceInfo.Set("grant_type", "client_credentials")
+	deviceInfo.Set("scope", "api.organization")
+	deviceInfo.Set("client_id", config.ClientID)
+	deviceInfo.Set("client_secret", config.ClientSecret)
+	deviceInfo.Set("deviceType", "21")
+	deviceInfo.Set("deviceName", "Bitwarden Event Forwarder")
+	deviceInfo.Set("deviceIdentifier", generateDeviceIdentifier())
 
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data))
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(deviceInfo.Encode()))
 	if err != nil {
 		return fmt.Errorf("error creating auth request: %w", err)
 	}
@@ -575,24 +557,34 @@ func authenticateWithBitwarden(config Configuration) error {
 	}
 	defer resp.Body.Close()
 
+	body, _ := ioutil.ReadAll(resp.Body)
+	
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
 		return fmt.Errorf("authentication failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var token OAuthToken
-	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
+	if err := json.Unmarshal(body, &token); err != nil {
 		return fmt.Errorf("error parsing token response: %w", err)
 	}
 
 	token.ExpiresAt = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second)
 	currentToken = &token
 
+	log.Printf("Successfully authenticated with Bitwarden API")
 	return nil
 }
 
+func generateDeviceIdentifier() string {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		hostname, _ := os.Hostname()
+		return fmt.Sprintf("%s-%d", hostname, os.Getpid())
+	}
+	return hex.EncodeToString(bytes)
+}
+
 func testBitwardenAPI(config Configuration) error {
-	// Simple test to verify API connectivity
 	req, err := http.NewRequest("GET", config.APIBaseURL+"/public/events", nil)
 	if err != nil {
 		return err
@@ -616,9 +608,7 @@ func testBitwardenAPI(config Configuration) error {
 }
 
 func testConfigFiles(config Configuration) error {
-	// Test field mapping file
 	if _, err := os.Stat(config.FieldMapFile); os.IsNotExist(err) {
-		// Create default field mapping file
 		defaultMapping := createDefaultFieldMapping()
 		if err := saveFieldMapping(config.FieldMapFile, defaultMapping); err != nil {
 			return fmt.Errorf("failed to create default field mapping: %w", err)
@@ -626,7 +616,6 @@ func testConfigFiles(config Configuration) error {
 		log.Printf("📋 Created default field mapping file: %s", config.FieldMapFile)
 	}
 
-	// Test event mapping file - must exist, don't create default
 	if _, err := os.Stat(config.EventMapFile); os.IsNotExist(err) {
 		return fmt.Errorf("event mapping file not found: %s (please provide bitwarden_event_map.json)", config.EventMapFile)
 	}
@@ -635,13 +624,11 @@ func testConfigFiles(config Configuration) error {
 }
 
 func testFilePermissions(config Configuration) error {
-	// Test marker file permissions
 	dir := filepath.Dir(config.MarkerFile)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("cannot create marker file directory: %w", err)
 	}
 
-	// Test write permissions
 	testFile := filepath.Join(dir, "test_permissions")
 	if err := ioutil.WriteFile(testFile, []byte("test"), 0644); err != nil {
 		return fmt.Errorf("cannot write to marker file directory: %w", err)
@@ -732,7 +719,6 @@ func processEventsWithRecovery(config Configuration, fieldMapping FieldMapping, 
 }
 
 func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, syslogWriter *SyslogWriter, lastMarker string) error {
-	// Poll period tracking
 	pollStart := time.Now()
 	var pollEnd time.Time
 	
@@ -753,7 +739,6 @@ func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, 
 	serviceStats.TotalAPIRequests++
 	serviceStats.Unlock()
 	
-	// Fetch events from Bitwarden API
 	events, newMarker, err := fetchBitwardenEventsWithRetry(config, currentMarker, &totalRetryErrors, &recoveries)
 	if err != nil {
 		numErrors++
@@ -764,12 +749,10 @@ func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, 
 	pollEnd = time.Now()
 	
 	if len(events) > 0 {
-		// Apply filtering
-		filteredEvents, droppedCount := filterEvents(events, fieldMapping.EventFiltering)
+		filteredEvents, droppedCount := filterEvents(events, fieldMapping.EventFiltering, fieldMapping.Statistics)
 		totalEventsFiltered += droppedCount
 		
 		if len(filteredEvents) > 0 {
-			// Forward events with enrichment
 			forwarded, dropped, cacheStats, lookupStats, changeStats, err := forwardEventsWithStats(
 				filteredEvents, config, fieldMapping, syslogWriter)
 			
@@ -788,7 +771,6 @@ func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, 
 		}
 	}
 	
-	// Update marker
 	if newMarker != "" && newMarker != currentMarker {
 		if err := saveMarkerToFile(config.MarkerFile, newMarker); err != nil {
 			numErrors++
@@ -801,7 +783,6 @@ func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, 
 		}
 	}
 	
-	// Calculate comprehensive statistics
 	periodStart := pollStart.Unix()
 	periodEnd := pollEnd.Unix()
 	
@@ -826,7 +807,6 @@ func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, 
 		serviceStats.Unlock()
 	}
 	
-	// Enhanced logging output similar to main4.go
 	log.Printf("📊 Poll Summary [%d - %d]: Events fetched: %d, filtered: %d, forwarded: %d, dropped: %d, "+
 		"rate: %.2f events/sec, errors: %d, retries: %d, recoveries: %d, cache hits: %d, misses: %d, "+
 		"lookups failed: %d, changes detected: %d, marker updates: %d, total forwarded: %d",
@@ -865,7 +845,6 @@ func fetchBitwardenEventsWithRetry(config Configuration, marker string, totalRet
 }
 
 func fetchBitwardenEvents(config Configuration, marker string) ([]BitwardenEvent, string, error) {
-	// Check if token needs refresh
 	if currentToken == nil || time.Now().After(currentToken.ExpiresAt.Add(-5*time.Minute)) {
 		if err := authenticateWithBitwarden(config); err != nil {
 			return nil, "", fmt.Errorf("token refresh failed: %w", err)
@@ -897,20 +876,20 @@ func fetchBitwardenEvents(config Configuration, marker string) ([]BitwardenEvent
 		return nil, "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
 	
-	var response struct {
-		Data   []BitwardenEvent `json:"data"`
-		Marker string           `json:"continuationToken"`
-	}
-	
+	var response BitwardenEventsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return nil, "", fmt.Errorf("error parsing JSON response: %w", err)
 	}
 	
-	return response.Data, response.Marker, nil
+	newMarker := ""
+	if response.ContinuationToken != nil {
+		newMarker = *response.ContinuationToken
+	}
+	
+	return response.Data, newMarker, nil
 }
 
-// Event filtering logic
-func filterEvents(events []BitwardenEvent, filter EventFilter) ([]BitwardenEvent, int) {
+func filterEvents(events []BitwardenEvent, filter EventFilter, stats StatisticsConfig) ([]BitwardenEvent, int) {
 	if filter.Mode == "all" {
 		return events, 0
 	}
@@ -921,12 +900,11 @@ func filterEvents(events []BitwardenEvent, filter EventFilter) ([]BitwardenEvent
 	for _, event := range events {
 		eventType := fmt.Sprintf("%d", event.Type)
 		
-		// Check if event should be processed
 		if shouldProcessEvent(event, eventType, filter) {
 			filteredEvents = append(filteredEvents, event)
 		} else {
 			droppedCount++
-			if filter.Statistics.EnableDetailedLogging {
+			if stats.EnableDetailedLogging {
 				log.Printf("🚫 Filtered event type %s", eventType)
 			}
 		}
@@ -935,30 +913,25 @@ func filterEvents(events []BitwardenEvent, filter EventFilter) ([]BitwardenEvent
 	return filteredEvents, droppedCount
 }
 
-// Enhanced event processing decision logic
 func shouldProcessEvent(event BitwardenEvent, eventType string, filter EventFilter) bool {
-	// Priority events always pass
 	for _, priority := range filter.PriorityEvents {
 		if eventType == priority {
 			return true
 		}
 	}
 	
-	// Check user filtering
 	if !passesUserFilter(event, filter.UserFiltering) {
 		return false
 	}
 	
-	// Check rate limiting
 	if !passesRateLimit(eventType, filter.RateLimiting) {
 		return false
 	}
 	
-	// Apply include/exclude logic
 	switch filter.Mode {
 	case "include":
 		if len(filter.IncludedEvents) == 0 {
-			return true // Include all if no specific includes
+			return true
 		}
 		for _, included := range filter.IncludedEvents {
 			if eventType == included {
@@ -980,7 +953,6 @@ func shouldProcessEvent(event BitwardenEvent, eventType string, filter EventFilt
 	}
 }
 
-// Rate limiting logic
 func passesRateLimit(eventType string, rateLimits map[string]RateLimit) bool {
 	limit, exists := rateLimits[eventType]
 	if !exists || !limit.Enabled {
@@ -993,7 +965,6 @@ func passesRateLimit(eventType string, rateLimits map[string]RateLimit) bool {
 	now := time.Now()
 	hourAgo := now.Add(-time.Hour)
 	
-	// Clean old timestamps
 	var recentEvents []time.Time
 	if timestamps, exists := rateLimitTracker.EventCounts[eventType]; exists {
 		for _, timestamp := range timestamps {
@@ -1003,26 +974,21 @@ func passesRateLimit(eventType string, rateLimits map[string]RateLimit) bool {
 		}
 	}
 	
-	// Check if we're under the limit
 	if len(recentEvents) >= limit.MaxPerHour {
 		return false
 	}
 	
-	// Add current event timestamp
 	recentEvents = append(recentEvents, now)
 	rateLimitTracker.EventCounts[eventType] = recentEvents
 	
 	return true
 }
 
-// User filtering logic
 func passesUserFilter(event BitwardenEvent, userFilter UserFilter) bool {
-	// Service account filtering
 	if userFilter.ExcludeServiceAccounts && isServiceAccount(event) {
 		return false
 	}
 	
-	// Include only specific users
 	if len(userFilter.IncludeOnlyUsers) > 0 {
 		userID := getUserIDFromEvent(event)
 		for _, user := range userFilter.IncludeOnlyUsers {
@@ -1033,7 +999,6 @@ func passesUserFilter(event BitwardenEvent, userFilter UserFilter) bool {
 		return false
 	}
 	
-	// Exclude specific users
 	userID := getUserIDFromEvent(event)
 	for _, user := range userFilter.ExcludeUsers {
 		if userID == user {
@@ -1044,7 +1009,6 @@ func passesUserFilter(event BitwardenEvent, userFilter UserFilter) bool {
 	return true
 }
 
-// Helper functions for event processing
 func getUserIDFromEvent(event BitwardenEvent) string {
 	if event.MemberID != nil {
 		return *event.MemberID
@@ -1053,12 +1017,9 @@ func getUserIDFromEvent(event BitwardenEvent) string {
 }
 
 func isServiceAccount(event BitwardenEvent) bool {
-	// Logic to determine if this is a service account event
-	// This would depend on how Bitwarden identifies service accounts
 	return false
 }
 
-// Enhanced forwarding with statistics
 func forwardEventsWithStats(events []BitwardenEvent, config Configuration, 
 	fieldMapping FieldMapping, syslogWriter *SyslogWriter) (int, int, CacheStats, LookupStats, ChangeStats, error) {
 	
@@ -1068,7 +1029,6 @@ func forwardEventsWithStats(events []BitwardenEvent, config Configuration,
 	var changeStats ChangeStats
 	
 	for _, event := range events {
-		// Enrich event with lookups
 		enrichedEvent, cacheHit, lookupSuccess := enrichEvent(event, fieldMapping, config)
 		
 		if cacheHit {
@@ -1083,16 +1043,13 @@ func forwardEventsWithStats(events []BitwardenEvent, config Configuration,
 			lookupStats.Success++
 		}
 		
-		// Format as CEF
 		cefMessage := formatEventAsCEF(enrichedEvent, config, fieldMapping)
 		syslogMessage := formatSyslogMessage("bitwarden-forwarder", cefMessage)
 		
-		// Truncate if too large
 		if len(syslogMessage) > config.MaxMsgSize {
 			syslogMessage = syslogMessage[:config.MaxMsgSize]
 		}
 		
-		// Send to syslog
 		if err := syslogWriter.Write(syslogMessage); err != nil {
 			log.Printf("🔄 Syslog write failed, attempting reconnect: %v", err)
 			if reconnectErr := syslogWriter.Reconnect(); reconnectErr != nil {
@@ -1113,12 +1070,11 @@ func forwardEventsWithStats(events []BitwardenEvent, config Configuration,
 
 func enrichEvent(event BitwardenEvent, fieldMapping FieldMapping, config Configuration) (map[string]interface{}, bool, bool) {
 	enriched := map[string]interface{}{
-		"id":           event.ID,
-		"type":         event.Type,
-		"date":         event.Date.Format(time.RFC3339),
-		"ipAddress":    event.IPAddress,
-		"device":       event.Device,
-		"object":       event.Object,
+		"id":     event.ID,
+		"type":   event.Type,
+		"date":   event.Date.Format(time.RFC3339),
+		"device": event.Device,
+		"object": event.Object,
 	}
 	
 	if event.MemberID != nil {
@@ -1136,16 +1092,38 @@ func enrichEvent(event BitwardenEvent, fieldMapping FieldMapping, config Configu
 	if event.PolicyID != nil {
 		enriched["policyId"] = *event.PolicyID
 	}
+	if event.ItemID != nil {
+		enriched["itemId"] = *event.ItemID
+	}
+	if event.InstallationID != nil {
+		enriched["installationId"] = *event.InstallationID
+	}
+	if event.IPAddress != nil {
+		enriched["ipAddress"] = *event.IPAddress
+	}
 	
-	// Add event type name
 	if eventName, exists := eventTypeMap[fmt.Sprintf("%d", event.Type)]; exists {
 		enriched["eventTypeName"] = eventName
 	}
+	enriched["deviceTypeName"] = getDeviceTypeName(event.Device)
 	
-	// TODO: Implement actual lookup enrichment
-	// This would involve making API calls to enrich with member names, group names, etc.
+	return enriched, true, true
+}
+
+func getDeviceTypeName(deviceType int) string {
+	deviceNames := map[int]string{
+		0: "Android", 1: "iOS", 2: "Chrome Extension", 3: "Firefox Extension",
+		4: "Opera Extension", 5: "Edge Extension", 6: "Windows Desktop", 7: "macOS Desktop",
+		8: "Linux Desktop", 9: "Chrome App", 10: "Vivaldi", 11: "Safari",
+		12: "UWP", 13: "Bitwarden", 14: "Directory Connector", 15: "Azure AD Connector",
+		16: "Okta Connector", 17: "OneLogin Connector", 18: "CLI", 19: "Connector",
+		20: "SCIM", 21: "SDK", 22: "Server", 23: "Windows CLI", 24: "macOS CLI", 25: "Linux CLI",
+	}
 	
-	return enriched, true, true // Placeholder return values
+	if name, exists := deviceNames[deviceType]; exists {
+		return name
+	}
+	return fmt.Sprintf("Unknown(%d)", deviceType)
 }
 
 func formatEventAsCEF(event map[string]interface{}, config Configuration, fieldMapping FieldMapping) string {
@@ -1176,24 +1154,20 @@ func formatEventAsCEF(event map[string]interface{}, config Configuration, fieldM
 	
 	extensions := make(map[string]string)
 	
-	// Apply field mappings
 	for sourceKey, targetKey := range fieldMapping.FieldMappings {
 		if value, exists := event[sourceKey]; exists && value != nil {
 			extensions[targetKey] = sanitizeCEFValue(fmt.Sprintf("%v", value))
 		}
 	}
 	
-	// Add unmapped fields
 	for k, v := range event {
 		if !isMappedField(k, fieldMapping.FieldMappings) && v != nil {
 			extensions[k] = sanitizeCEFValue(fmt.Sprintf("%v", v))
 		}
 	}
 	
-	// Format extensions in order
 	var parts []string
 	
-	// Ordered fields first
 	for _, field := range fieldMapping.OrderedFields {
 		if value, exists := extensions[field]; exists {
 			parts = append(parts, fmt.Sprintf("%s=%s", field, value))
@@ -1201,7 +1175,6 @@ func formatEventAsCEF(event map[string]interface{}, config Configuration, fieldM
 		}
 	}
 	
-	// Remaining fields alphabetically
 	var remaining []string
 	for k := range extensions {
 		remaining = append(remaining, k)
@@ -1217,27 +1190,17 @@ func formatEventAsCEF(event map[string]interface{}, config Configuration, fieldM
 
 func mapEventTypeToSeverity(eventType string) int {
 	severityMap := map[string]int{
-		"1000": 6, // Login
-		"1001": 6, // Changed password
-		"1002": 6, // 2FA enabled
-		"1005": 8, // Failed login
-		"1006": 8, // Failed 2FA
-		"1500": 6, // Invited user
-		"1501": 6, // Confirmed user
-		"1502": 6, // Edited user
-		"1503": 7, // Removed user
-		"1700": 7, // Modified policy
-		"1600": 7, // Edited org settings
+		"1000": 6, "1001": 6, "1002": 6, "1005": 8, "1006": 8,
+		"1500": 6, "1501": 6, "1502": 6, "1503": 7, "1700": 7, "1600": 7,
 	}
 	
 	if severity, exists := severityMap[eventType]; exists {
 		return severity
 	}
-	return 5 // Default severity
+	return 5
 }
 
 func sanitizeCEFValue(value string) string {
-	// Escape special CEF characters
 	value = strings.ReplaceAll(value, "\\", "\\\\")
 	value = strings.ReplaceAll(value, "=", "\\=")
 	value = strings.ReplaceAll(value, "|", "\\|")
@@ -1247,8 +1210,8 @@ func sanitizeCEFValue(value string) string {
 }
 
 func formatSyslogMessage(hostname, message string) string {
-	priority := "134" // local0.info
-	timestamp := time.Now().Format("Jan _2 15:04:05") // Use underscore for proper single-digit day spacing
+	priority := "134"
+	timestamp := time.Now().Format("Jan _2 15:04:05")
 	return fmt.Sprintf("<%s>%s %s %s", priority, timestamp, hostname, message)
 }
 
@@ -1284,7 +1247,7 @@ func loadEventTypeMap(filename string) map[string]string {
 		if os.IsNotExist(err) {
 			log.Printf("❌ Event type mapping file not found: %s", filename)
 			log.Printf("📝 Please ensure bitwarden_event_map.json exists")
-			return make(map[string]string) // Return empty map if file doesn't exist
+			return make(map[string]string)
 		}
 		log.Printf("❌ Error reading event type mapping file: %v", err)
 		return make(map[string]string)
@@ -1308,75 +1271,45 @@ func createDefaultFieldMapping() FieldMapping {
 			"changeType", "changeCount", "changedFields", "oldValues", "newValues",
 		},
 		FieldMappings: map[string]string{
-			"date":           "rt",
-			"type":           "cs1",
-			"id":             "cs2",
-			"memberId":       "suser",
-			"actingUserId":   "actingUserId",
-			"ipAddress":      "host_ip",
-			"device":         "device",
-			"groupId":        "groupId",
-			"collectionId":   "collectionId",
-			"policyId":       "policyId",
-			"object":         "objectname",
+			"date": "rt", "type": "cs1", "id": "cs2", "memberId": "suser",
+			"actingUserId": "actingUserId", "ipAddress": "host_ip", "device": "device",
+			"groupId": "groupId", "collectionId": "collectionId", "policyId": "policyId", "object": "objectname",
 		},
 		Lookups: map[string]LookupConfig{
 			"memberId": {
 				Endpoint: "/public/members/{id}",
 				ResponseMapping: map[string]string{
-					"name":                  "memberName",
-					"email":                 "memberEmail",
-					"status":                "memberStatus",
-					"twoFactorEnabled":      "member2FA",
-					"type":                  "memberType",
-					"accessAll":             "memberAccessAll",
-					"externalId":            "memberExternalId",
-					"resetPasswordEnrolled": "memberResetPasswordEnrolled",
+					"name": "memberName", "email": "memberEmail", "status": "memberStatus",
+					"twoFactorEnabled": "member2FA", "type": "memberType", "accessAll": "memberAccessAll",
+					"externalId": "memberExternalId", "resetPasswordEnrolled": "memberResetPasswordEnrolled",
 				},
 			},
 		},
 		CacheInvalidationRules: map[string][]string{
-			"1700": {"policyId"},
-			"1500": {"memberId"}, "1501": {"memberId"}, "1502": {"memberId"},
+			"1700": {"policyId"}, "1500": {"memberId"}, "1501": {"memberId"}, "1502": {"memberId"},
 			"1503": {"memberId"}, "1504": {"memberId"}, "1505": {"memberId"},
 			"1400": {"groupId"}, "1401": {"groupId"}, "1402": {"groupId"},
 			"1300": {"collectionId"}, "1301": {"collectionId"}, "1302": {"collectionId"},
 		},
 		EventFiltering: EventFilter{
 			Mode: "exclude",
-			ExcludedEvents: []string{
-				"1114", "1107", "1108", "1109", "1110", "1111", "1112", "1113", "1117",
-			},
+			ExcludedEvents: []string{"1114", "1107", "1108", "1109", "1110", "1111", "1112", "1113", "1117"},
 			IncludedEvents: []string{},
 			RateLimiting: map[string]RateLimit{
 				"1114": {MaxPerHour: 10, Enabled: true},
 				"1107": {MaxPerHour: 50, Enabled: true},
 				"1111": {MaxPerHour: 20, Enabled: true},
 			},
-			PriorityEvents: []string{
-				"1000", "1001", "1002", "1005", "1006",
-				"1500", "1501", "1502", "1503",
-				"1700", "1600", "1601",
-			},
-			UserFiltering: UserFilter{
-				ExcludeServiceAccounts: true,
-				ExcludeUsers:          []string{},
-				IncludeOnlyUsers:      []string{},
-			},
+			PriorityEvents: []string{"1000", "1001", "1002", "1005", "1006", "1500", "1501", "1502", "1503", "1700", "1600", "1601"},
+			UserFiltering: UserFilter{ExcludeServiceAccounts: true, ExcludeUsers: []string{}, IncludeOnlyUsers: []string{}},
 		},
 		Statistics: StatisticsConfig{
-			EnableDetailedLogging:   true,
-			LogIntervalEvents:       100,
-			TrackCacheMetrics:       true,
-			TrackPerformanceMetrics: true,
+			EnableDetailedLogging: true, LogIntervalEvents: 100,
+			TrackCacheMetrics: true, TrackPerformanceMetrics: true,
 		},
-		CEFVendor:  "Bitwarden",
-		CEFProduct: "Events",
-		CEFVersion: "1.0",
+		CEFVendor: "Bitwarden", CEFProduct: "Events", CEFVersion: "1.0",
 	}
 }
-
-// Remove the redundant createDefaultEventMap function since events are loaded from JSON file
 
 func saveFieldMapping(filename string, mapping FieldMapping) error {
 	dir := filepath.Dir(filename)
@@ -1385,20 +1318,6 @@ func saveFieldMapping(filename string, mapping FieldMapping) error {
 	}
 	
 	data, err := json.MarshalIndent(mapping, "", "  ")
-	if err != nil {
-		return err
-	}
-	
-	return ioutil.WriteFile(filename, data, 0644)
-}
-
-func saveEventMap(filename string, eventMap map[string]string) error {
-	dir := filepath.Dir(filename)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-	
-	data, err := json.MarshalIndent(eventMap, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -1425,7 +1344,6 @@ func saveMarkerToFile(filename string, marker string) error {
 	return ioutil.WriteFile(filename, []byte(marker), 0644)
 }
 
-// Utility functions
 func getEnvOrDefault(key, defaultValue string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
