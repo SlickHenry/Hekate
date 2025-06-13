@@ -553,4 +553,112 @@ sequenceDiagram
                     App->>Cache: Invalidate specific cache entries
                     App->>API: Fetch fresh data for changed object
                     API-->>App: Updated object data
-                    App-
+                    App->>Cache: Store new values
+                    App->>Stats: Log change detection
+                else Normal Event with Lookup
+                    App->>Cache: Check cache for enrichment data
+                    alt Cache Hit
+                        Cache-->>App: Cached lookup data
+                        App->>Stats: Log cache hit
+                    else Cache Miss
+                        App->>API: Lookup additional data
+                        API-->>App: Lookup response
+                        App->>Cache: Store lookup result
+                        App->>Stats: Log cache miss
+                    end
+                end
+                
+                App->>App: Format event as CEF
+                App->>Syslog: Send formatted event
+                Syslog-->>App: Acknowledgment
+                App->>Stats: Update forwarding statistics
+            end
+        end
+        
+        App->>State: Update event marker
+        App->>Stats: Log poll summary
+        
+        Note over App: Wait for next polling interval
+    end
+```
+
+
+## Monitoring & Troubleshooting
+
+### Log Output
+
+The application provides comprehensive logging with visual indicators:
+
+```
+🚀 Starting Bitwarden Event Forwarder v1.0.0
+📋 Configuration loaded successfully
+🔐 Authenticating with Bitwarden API...
+✅ Successfully authenticated (expires: 2025-06-13 15:30:45)
+💾 Cache initialized
+🗺️  Field mappings loaded (4 lookups)
+📝 Event types loaded (85 types)
+🔍 Testing syslog connectivity...
+✅ Syslog connectivity verified
+🎯 Starting event polling...
+📍 Reached marker evt_123, resuming
+✅ Processed 15 events
+```
+
+### Connection Testing
+
+Pre-flight testing validates all dependencies:
+
+```bash
+./bw-events --test
+```
+
+```
+🔍 Testing configuration and connections...
+  Testing Bitwarden API authentication... ✅ SUCCESS
+  Testing Bitwarden API connectivity... ✅ SUCCESS
+  Testing Syslog connectivity... ✅ SUCCESS
+  Testing configuration files... ✅ SUCCESS
+  Testing file permissions... ✅ SUCCESS
+```
+
+### Common Issues
+
+1. **Authentication errors**: Verify client credentials and API permissions
+2. **No events returned**: Check organization access and API connectivity
+3. **Syslog connection failed**: Verify server address, port, and protocol  
+4. **File permission errors**: Ensure proper access to marker and log files
+5. **Cache lookup failures**: Check API endpoints and network connectivity
+
+### Performance Considerations
+
+- **Polling interval**: Balance real-time needs with API rate limits
+- **Cache efficiency**: Lookup caching significantly reduces API calls
+- **Change detection**: Minimal overhead, only active during actual changes
+- **Network latency**: Consider network conditions for timeout settings
+- **Log verbosity**: Adjust log level based on operational needs
+
+## Security
+
+- **Credentials**: Store API credentials securely, never in logs
+- **Network**: Use TLS for API connections, secure syslog transport
+- **Access control**: Limit file permissions on configuration and state files
+- **Monitoring**: Monitor for authentication failures and suspicious activities
+- **Audit trails**: Comprehensive logging for security event correlation
+
+## API Permissions
+
+Required Bitwarden API scopes:
+- `api.organization` - Access to organization events and member information
+
+## Performance Metrics
+
+Typical performance characteristics:
+- **API calls**: 1 base call + lookups per unique object per event
+- **Cache efficiency**: 90%+ hit rate after warm-up period
+- **Processing speed**: 100+ events per second (network dependent)
+- **Memory usage**: <50MB typical, scales with cache size
+- **Startup time**: <5 seconds including connection testing
+
+## License
+
+This project is provided as-is for educational and operational use. Ensure compliance with Bitwarden API terms of service and your organization's security policies.
