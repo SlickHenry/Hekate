@@ -1,0 +1,120 @@
+{
+  "ordered_fields": [
+    "rt",
+    "cs1",
+    "cs2",
+    "suser",
+    "email",
+    "status",
+    "2fa",
+    "host_ip",
+    "device",
+    "groupId",
+    "collectionId",
+    "policyId",
+    "actingUserId",
+    "objectname",
+    "community",
+    "roles",
+    "caseName",
+    "hasDataChanges",
+    "changeType",
+    "changeCount",
+    "changedFields",
+    "oldValues",
+    "newValues"
+  ],
+  "field_mappings": {
+    "date": "rt",
+    "type": "cs1",
+    "id": "cs2",
+    "memberId": "suser",
+    "actingUserId": "actingUserId",
+    "email": "email",
+    "status": "status",
+    "twoFactorEnabled": "2fa",
+    "ipAddress": "host_ip",
+    "device": "device",
+    "groupId": "groupId",
+    "collectionId": "collectionId",
+    "policyId": "policyId",
+    "object": "objectname"
+  },
+  "lookups": {
+    "memberId": {
+      "endpoint": "/public/members/{id}",
+      "response_mapping": {
+        "name": "memberName",
+        "email": "memberEmail",
+        "status": "memberStatus",
+        "twoFactorEnabled": "member2FA",
+        "type": "memberType",
+        "accessAll": "memberAccessAll",
+        "externalId": "memberExternalId",
+        "resetPasswordEnrolled": "memberResetPasswordEnrolled"
+      }
+    },
+    "actingUserId": {
+      "endpoint": "/public/members/{id}",
+      "response_mapping": {
+        "name": "actingUserName",
+        "email": "actingUserEmail",
+        "status": "actingUserStatus",
+        "twoFactorEnabled": "actingUser2FA",
+        "type": "actingUserType"
+      }
+    },
+    "groupId": {
+      "endpoint": "/public/groups/{id}",
+      "response_mapping": {
+        "name": "groupName",
+        "accessAll": "groupAccessAll",
+        "externalId": "groupExternalId"
+      }
+    },
+    "collectionId": {
+      "endpoint": "/public/collections/{id}",
+      "response_mapping": {
+        "name": "collectionName",
+        "externalId": "collectionExternalId"
+      }
+    },
+    "policyId": {
+      "endpoint": "/public/policies/{type}",
+      "response_mapping": {
+        "type": "policyType",
+        "enabled": "policyEnabled",
+        "policyTypeName": "policyTypeName"
+      }
+    }
+  },
+  "cache_invalidation_rules": {
+    "1700": ["policyId"],
+    "1500": ["memberId"],
+    "1501": ["memberId"],
+    "1502": ["memberId"],
+    "1503": ["memberId"],
+    "1504": ["memberId"],
+    "1505": ["memberId"],
+    "1506": ["memberId"],
+    "1507": ["memberId"],
+    "1508": ["memberId"],
+    "1509": ["memberId"],
+    "1510": ["memberId"],
+    "1511": ["memberId"],
+    "1512": ["memberId"],
+    "1513": ["memberId"],
+    "1514": ["memberId"],
+    "1515": ["memberId"],
+    "1516": ["memberId"],
+    "1400": ["groupId"],
+    "1401": ["groupId"],
+    "1402": ["groupId"],
+    "1300": ["collectionId"],
+    "1301": ["collectionId"],
+    "1302": ["collectionId"]
+  },
+  "cef_vendor": "Bitwarden",
+  "cef_product": "Events",
+  "cef_version": "1.0"
+}
