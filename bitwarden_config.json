@@ -1,0 +1,107 @@
+{
+  "_comment": "Bitwarden Event Forwarder v2.0 Configuration",
+  
+  "bitwarden_api": {
+    "api_base_url": "https://api.bitwarden.com",
+    "identity_url": "https://identity.bitwarden.com",
+    "client_id": "your_client_id_from_bitwarden_portal",
+    "client_secret": "your_client_secret_from_bitwarden_portal"
+  },
+  
+  "syslog": {
+    "server": "your.syslog.server.com",
+    "port": "514",
+    "protocol": "tcp"
+  },
+  
+  "polling": {
+    "fetch_interval": 60,
+    "connection_timeout": 30,
+    "max_retries": 3,
+    "retry_delay": 5,
+    "max_backoff_delay": 300
+  },
+  
+  "logging": {
+    "log_level": "info",
+    "log_file": "/var/log/bitwarden-events.log",
+    "verbose": false
+  },
+  
+  "files": {
+    "marker_file": "/var/lib/bitwarden/marker.txt",
+    "field_map_file": "/etc/bitwarden/bitwarden_field_map.json",
+    "event_map_file": "/etc/bitwarden/bitwarden_event_map.json"
+  },
+  
+  "syslog_formatting": {
+    "max_message_size": 8192,
+    "hostname_override": ""
+  },
+  
+  "monitoring": {
+    "health_check_port": 8080,
+    "enable_metrics": true
+  },
+  
+  "filtering": {
+    "_comment": "Event filtering configuration - can also be defined in field_map.json",
+    "mode": "exclude",
+    "excluded_events": [
+      "1114",
+      "1107",
+      "1108",
+      "1109",
+      "1110",
+      "1111",
+      "1112",
+      "1113",
+      "1117"
+    ],
+    "rate_limiting": {
+      "1114": {"max_per_hour": 10, "enabled": true},
+      "1107": {"max_per_hour": 50, "enabled": true},
+      "1111": {"max_per_hour": 20, "enabled": true}
+    },
+    "priority_events": [
+      "1000",
+      "1001",
+      "1002",
+      "1005",
+      "1006",
+      "1500",
+      "1501",
+      "1502", 
+      "1503",
+      "1700",
+      "1600"
+    ]
+  },
+  
+  "performance": {
+    "enable_detailed_logging": true,
+    "track_cache_metrics": true,
+    "track_performance_metrics": true,
+    "log_interval_events": 100
+  },
+  
+  "_usage_examples": {
+    "minimal_config": {
+      "client_id": "required",
+      "client_secret": "required",
+      "syslog_server": "required"
+    },
+    "environment_variables": {
+      "BW_CLIENT_ID": "Bitwarden API Client ID",
+      "BW_CLIENT_SECRET": "Bitwarden API Client Secret",
+      "SYSLOG_SERVER": "Syslog server address",
+      "SYSLOG_PORT": "Syslog server port",
+      "FETCH_INTERVAL": "Polling interval in seconds"
+    },
+    "command_line_usage": [
+      "./bw-events --client-id ID --client-secret SECRET --syslog-server HOST",
+      "./bw-events --test --validate",
+      "./bw-events --config /etc/bitwarden/config.json"
+    ]
+  }
+}

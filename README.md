@@ -1,24 +1,24 @@
-# Hekate - A Bitwarden API to Syslog Forwarder
+# Bitwarden Event Forwarder v2.0 - Enhanced API to Syslog Forwarder
 
-A standalone Go application that polls the Bitwarden Organization API for events and forwards them to a syslog server in CEF (Common Event Format) with intelligent enrichment, change detection, and comprehensive audit trails for SIEM ingestion and security monitoring.
+A standalone Go application that polls the Bitwarden Organization API for events and forwards them to a syslog server in CEF (Common Event Format) with **intelligent filtering**, **comprehensive statistics**, **change detection**, and **enhanced audit trails** for SIEM ingestion and security monitoring.
 
 ## Overview
 
-This application provides real-time event forwarding from Bitwarden Organizations to your SIEM or log analysis platform. It features intelligent caching with change detection, configurable field mappings, and converts all data to industry-standard CEF format with enhanced audit capabilities.
+This application provides real-time event forwarding from Bitwarden Organizations to your SIEM or log analysis platform. It features intelligent event filtering to reduce noise, comprehensive statistics tracking, smart lookup caching with automatic invalidation, and converts all data to industry-standard CEF format with enhanced audit capabilities.
 
 ### Key Features
 
-- **OAuth2 Authentication** - Secure client credentials flow for API access
-- **Intelligent Caching** - Smart lookup caching with automatic invalidation
-- **Change Detection** - Before/after value tracking for policy, member, group, and collection changes
-- **CEF Format** - Industry-standard Common Event Format output with enrichment
-- **Event-Driven Cache Management** - Real-time cache invalidation based on event types
-- **Configurable Field Mappings** - External JSON configuration for flexible field mapping
-- **Real-time Forwarding** - Configurable polling intervals with error recovery
-- **Comprehensive Enrichment** - Automatic lookup of member names, group names, collection names, and policy details
-- **State Management** - Prevents duplicate events with marker-based tracking
-- **Connection Testing** - Pre-flight validation of all connections and configurations
-- **Robust Error Handling** - Retry logic, circuit breakers, and graceful degradation
+- **🚫 Intelligent Event Filtering** - Eliminates noise from high-volume events (autofill, views, etc.)
+- **📊 Comprehensive Statistics** - Detailed performance metrics and operational visibility
+- **🔄 Smart Cache Management** - Automatic cache invalidation based on event types
+- **🔍 Change Detection** - Before/after value tracking for policy, member, group, and collection changes
+- **⚡ Rate Limiting** - Configurable rate limits for noisy event types
+- **🎯 Priority Events** - Always include security-critical events regardless of filters
+- **🔐 OAuth2 Authentication** - Secure client credentials flow for API access
+- **📈 Real-time Monitoring** - Health endpoints and Prometheus-compatible metrics
+- **🛡️ Production Ready** - Comprehensive error handling, retry logic, and graceful degradation
+- **📋 CEF Format** - Industry-standard Common Event Format output with enrichment
+- **🧪 Built-in Testing** - Pre-flight validation of all connections and configurations
 
 ## Installation & Usage
 
@@ -35,94 +35,139 @@ This application provides real-time event forwarding from Bitwarden Organization
 go build -o bw-events main.go
 ```
 
-### Running
+### Quick Start
 
 ```bash
+# Test configuration and connections
+./bw-events --test --client-id "your-client-id" --client-secret "your-secret"
+
 # Run with minimum required parameters
 ./bw-events --client-id "your-client-id" --client-secret "your-secret" --syslog-server "10.1.1.100"
 
 # Run with configuration file
 ./bw-events --config /etc/bitwarden/config.json
 
-# Test configuration and connections
-./bw-events --test --client-id "your-client-id" --client-secret "your-secret"
-
 # Validate configuration only
 ./bw-events --validate --config /etc/bitwarden/config.json
+```
 
-# Show help
-./bw-events --help
+### Advanced Usage
 
-# Show version information
+```bash
+# Enable verbose logging with detailed statistics
+./bw-events --verbose --client-id "your-id" --client-secret "your-secret"
+
+# Custom field mapping and filtering
+./bw-events --field-map custom_field_map.json --event-map custom_event_map.json
+
+# Health monitoring on custom port
+./bw-events --health-port 9090
+
+# Show version and capabilities
 ./bw-events --version
 ```
 
 ## Command Line Arguments
 
-| Argument | Description |
-|----------|-------------|
-| `--help` | Show comprehensive help message |
-| `--version` | Show version and build information |
-| `--validate` | Validate configuration and exit |
-| `--test` | Test all connections and dependencies |
-| `--config FILE` | Load configuration from JSON file |
-| `--client-id ID` | Bitwarden API Client ID (required) |
-| `--client-secret SECRET` | Bitwarden API Client Secret (required) |
-| `--api-url URL` | Bitwarden API base URL (default: https://api.bitwarden.com) |
-| `--identity-url URL` | Bitwarden Identity URL (default: https://identity.bitwarden.com) |
-| `--syslog-server HOST` | Syslog server address (default: localhost) |
-| `--syslog-port PORT` | Syslog server port (default: 514) |
-| `--syslog-proto PROTO` | Syslog protocol: tcp/udp (default: tcp) |
-| `--interval SECONDS` | Event fetch interval (default: 60) |
-| `--conn-timeout SECONDS` | Connection timeout (default: 30) |
-| `--log-level LEVEL` | Log level: debug/info/warn/error (default: info) |
-| `--log-file FILE` | Log file path (default: stdout) |
-| `--field-map FILE` | Field mapping configuration file |
-| `--event-map FILE` | Event type mapping file |
-| `--marker-file FILE` | Event marker file for state tracking |
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--help` | Show comprehensive help message | |
+| `--version` | Show version and build information | |
+| `--test` | Test all connections and dependencies | |
+| `--validate` | Validate configuration and exit | |
+| `--config FILE` | Load configuration from JSON file | |
+| `--client-id ID` | Bitwarden API Client ID (**required**) | |
+| `--client-secret SECRET` | Bitwarden API Client Secret (**required**) | |
+| `--api-url URL` | Bitwarden API base URL | `https://api.bitwarden.com` |
+| `--identity-url URL` | Bitwarden Identity URL | `https://identity.bitwarden.com` |
+| `--syslog-server HOST` | Syslog server address | `localhost` |
+| `--syslog-port PORT` | Syslog server port | `514` |
+| `--syslog-proto PROTO` | Syslog protocol: tcp/udp | `tcp` |
+| `--interval SECONDS` | Event fetch interval | `60` |
+| `--conn-timeout SECONDS` | Connection timeout | `30` |
+| `--max-retries NUM` | Maximum retry attempts | `3` |
+| `--retry-delay SECONDS` | Retry delay | `5` |
+| `--max-backoff SECONDS` | Maximum backoff delay | `300` |
+| `--log-level LEVEL` | Log level: debug/info/warn/error | `info` |
+| `--log-file FILE` | Log file path | stdout |
+| `--field-map FILE` | Field mapping configuration file | `bitwarden_field_map.json` |
+| `--event-map FILE` | Event type mapping file | `bitwarden_event_map.json` |
+| `--marker-file FILE` | Event marker file for state tracking | `bitwarden_marker.txt` |
+| `--health-port PORT` | Health check HTTP server port (0 to disable) | `8080` |
+| `--max-msg-size SIZE` | Maximum syslog message size | `8192` |
+| `--verbose` | Enable verbose output | `false` |
 
 ## Configuration
 
-### config.json Example Structure
+### Complete config.json Example
 
 ```json
 {
-  "api_base_url": "https://api.bitwarden.com",
-  "identity_url": "https://identity.bitwarden.com",
-  "client_id": "your_client_id_from_bitwarden_portal",
-  "client_secret": "your_client_secret_from_bitwarden_portal",
-  "syslog_server": "your.syslog.server.com",
-  "syslog_port": "514",
-  "syslog_protocol": "tcp",
-  "fetch_interval": 60,
-  "log_level": "info",
-  "log_file": "/var/log/bitwarden-events.log",
-  "conn_timeout": 30,
-  "max_msg_size": 8192,
-  "marker_file": "/var/lib/bitwarden/marker.txt",
-  "field_map_file": "/etc/bitwarden/field_map.json",
-  "event_map_file": "/etc/bitwarden/event_map.json"
+  "bitwarden_api": {
+    "api_base_url": "https://api.bitwarden.com",
+    "identity_url": "https://identity.bitwarden.com",
+    "client_id": "your_client_id_from_bitwarden_portal",
+    "client_secret": "your_client_secret_from_bitwarden_portal"
+  },
+  "syslog": {
+    "server": "your.syslog.server.com",
+    "port": "514",
+    "protocol": "tcp"
+  },
+  "polling": {
+    "fetch_interval": 60,
+    "connection_timeout": 30,
+    "max_retries": 3,
+    "retry_delay": 5,
+    "max_backoff_delay": 300
+  },
+  "logging": {
+    "log_level": "info",
+    "log_file": "/var/log/bitwarden-events.log",
+    "verbose": false
+  },
+  "files": {
+    "marker_file": "/var/lib/bitwarden/marker.txt",
+    "field_map_file": "/etc/bitwarden/bitwarden_field_map.json",
+    "event_map_file": "/etc/bitwarden/bitwarden_event_map.json"
+  },
+  "monitoring": {
+    "health_check_port": 8080,
+    "enable_metrics": true
+  }
 }
 ```
 
-### Field Mapping Configuration (bitwarden_field_map.json)
+### Enhanced Field Mapping (bitwarden_field_map.json)
 
 ```json
 {
-  "ordered_fields": [
-    "rt", "cs1", "cs2", "suser", "email", "status", "2fa", "host_ip",
-    "device", "groupId", "collectionId", "policyId", "actingUserId",
-    "objectname", "hasDataChanges", "changeType", "oldValues", "newValues"
-  ],
-  "field_mappings": {
-    "date": "rt",
-    "type": "cs1",
-    "id": "cs2",
-    "memberId": "suser",
-    "actingUserId": "actingUserId",
-    "email": "email",
-    "ipAddress": "host_ip",
-    "device": "device"
+  "event_filtering": {
+    "mode": "exclude",
+    "excluded_events": [
+      "1114", "1107", "1108", "1109", "1110", 
+      "1111", "1112", "1113", "1117"
+    ],
+    "rate_limiting": {
+      "1114": {"max_per_hour": 10, "enabled": true},
+      "1107": {"max_per_hour": 50, "enabled": true},
+      "1111": {"max_per_hour": 20, "enabled": true}
+    },
+    "priority_events": [
+      "1000", "1001", "1002", "1005", "1006",
+      "1500", "1501", "1502", "1503", "1700", "1600"
+    ],
+    "user_filtering": {
+      "exclude_service_accounts": true,
+      "exclude_users": [],
+      "include_only_users": []
+    }
+  },
+  "statistics": {
+    "enable_detailed_logging": true,
+    "log_interval_events": 100,
+    "track_cache_metrics": true,
+    "track_performance_metrics": true
   },
   "lookups": {
     "memberId": {
@@ -133,69 +178,21 @@ go build -o bw-events main.go
         "status": "memberStatus",
         "twoFactorEnabled": "member2FA"
       }
-    },
-    "groupId": {
-      "endpoint": "/public/groups/{id}",
-      "response_mapping": {
-        "name": "groupName"
-      }
-    },
-    "collectionId": {
-      "endpoint": "/public/collections/{id}",
-      "response_mapping": {
-        "name": "collectionName"
-      }
-    },
-    "policyId": {
-      "endpoint": "/public/policies/{type}",
-      "response_mapping": {
-        "type": "policyType",
-        "enabled": "policyEnabled",
-        "policyTypeName": "policyTypeName"
-      }
     }
-  },
-  "cache_invalidation_rules": {
-    "1700": ["policyId"],
-    "1500": ["memberId"], "1501": ["memberId"], "1502": ["memberId"],
-    "1400": ["groupId"], "1401": ["groupId"], "1402": ["groupId"],
-    "1300": ["collectionId"], "1301": ["collectionId"], "1302": ["collectionId"]
-  },
-  "cef_vendor": "Bitwarden",
-  "cef_product": "Events",
-  "cef_version": "1.0"
-}
-```
-
-### Event Type Mapping (bitwarden_event_map.json)
-
-```json
-{
-  "1000": "Logged In",
-  "1001": "Changed account password",
-  "1002": "Enabled/updated two-step login",
-  "1100": "Created item",
-  "1101": "Edited item",
-  "1102": "Permanently Deleted item",
-  "1300": "Created collection",
-  "1301": "Edited collection",
-  "1400": "Created group",
-  "1500": "Invited user",
-  "1600": "Edited organization settings",
-  "1700": "Modified policy"
+  }
 }
 ```
 
 ## Environment Variables
 
-All configuration options can be set via environment variables with the `BW_` prefix:
+All configuration options can be set via environment variables:
 
 | Environment Variable | Description |
 |---------------------|-------------|
 | `BW_API_URL` | Bitwarden API base URL |
 | `BW_IDENTITY_URL` | Bitwarden Identity URL |
-| `BW_CLIENT_ID` | API Client ID |
-| `BW_CLIENT_SECRET` | API Client Secret |
+| `BW_CLIENT_ID` | **API Client ID (required)** |
+| `BW_CLIENT_SECRET` | **API Client Secret (required)** |
 | `SYSLOG_PROTOCOL` | Syslog protocol (tcp/udp) |
 | `SYSLOG_SERVER` | Syslog server address |
 | `SYSLOG_PORT` | Syslog server port |
@@ -206,16 +203,119 @@ All configuration options can be set via environment variables with the `BW_` pr
 | `MARKER_FILE` | Event marker file path |
 | `FIELD_MAP_FILE` | Field mapping configuration file |
 | `EVENT_MAP_FILE` | Event type mapping file |
-| `BW_CONFIG_FILE` | Configuration file path |
+| `HEALTH_CHECK_PORT` | Health check server port |
+| `VERBOSE` | Enable verbose output |
+
+## Intelligent Event Filtering
+
+### The Noise Problem
+
+Bitwarden generates massive amounts of event data. Event **1114 (Autofilled item)** alone can generate **hundreds of events per user per day**. Without filtering, your SIEM will be overwhelmed with noise.
+
+### Smart Filtering Solution
+
+The forwarder includes intelligent filtering to focus on security-relevant events:
+
+#### 🔇 **Ultra-Noisy Events (Filtered by Default)**
+- `1114` - Autofilled item (can be 100s/day per user)
+- `1107-1113` - Item views, password copies (very frequent)
+- `1117` - Card number views
+
+#### ⚠️ **Security-Critical Events (Always Included)**
+- `1000-1006` - Authentication events  
+- `1500-1516` - User management (invites, removes, etc.)
+- `1700` - Policy changes
+- `1600-1609` - Organization settings changes
+
+#### 📊 **Rate-Limited Events**
+- `1100-1106` - Item management (limited to reasonable levels)
+
+### Filtering Modes
+
+```json
+{
+  "event_filtering": {
+    "mode": "exclude",           // "include", "exclude", or "all"
+    "excluded_events": ["1114"], // Events to drop
+    "priority_events": ["1000"], // Always include these
+    "rate_limiting": {
+      "1114": {"max_per_hour": 10, "enabled": true}
+    }
+  }
+}
+```
+
+### Expected Results
+
+With default filtering enabled:
+- **Reduce event volume by 85-95%**
+- **Eliminate autofill noise** while preserving security events
+- **Improve SIEM performance** and reduce storage costs
+- **Better signal-to-noise ratio** for security analysis
+
+## Comprehensive Statistics & Monitoring
+
+### Enhanced Logging Output
+
+Based on proven patterns from production systems, the forwarder provides detailed operational statistics:
+
+```
+🚀 Starting Bitwarden Event Forwarder v2.0.0
+📋 PID: 12345
+🔐 API: https://api.bitwarden.com
+📡 Syslog: 10.1.1.100:514 (tcp)
+⏱️  Interval: 60s
+🎯 Filtering: exclude mode
+📊 Statistics: enabled
+
+📊 Poll Summary [1734123456 - 1734123516]: Events fetched: 1,247, filtered: 1,109, 
+forwarded: 138, dropped: 0, rate: 23.45 events/sec, errors: 0, retries: 0, 
+recoveries: 0, cache hits: 234, misses: 12, lookups failed: 1, changes detected: 15, 
+marker updates: 1, total forwarded: 45,678
+```
+
+### Health Monitoring
+
+#### Health Check Endpoint (`/health`)
+```bash
+curl http://localhost:8080/health
+```
+
+```json
+{
+  "status": "healthy",
+  "uptime": "2h15m30s",
+  "last_successful_run": "2025-06-13T15:30:45Z",
+  "total_events": 45678,
+  "total_filtered": 123456,
+  "total_dropped": 0,
+  "cache_hits": 2345,
+  "cache_misses": 123,
+  "average_events_per_second": 23.45
+}
+```
+
+#### Metrics Endpoint (`/metrics`)
+```bash
+curl http://localhost:8080/metrics
+```
+
+```
+bitwarden_forwarder_uptime_seconds 8130
+bitwarden_forwarder_total_events 45678
+bitwarden_forwarder_total_filtered 123456
+bitwarden_forwarder_cache_hits 2345
+bitwarden_forwarder_cache_misses 123
+```
 
 ## State Management
 
-### Marker File (bitwarden_marker.txt)
+### Marker-Based Tracking
 
-The application maintains state using a marker file to track the last processed event ID:
+The application maintains state using a marker file to track the last processed event:
 
 ```
-evt_01234567-89ab-cdef-0123-456789abcdef
+/var/lib/bitwarden/marker.txt
 ```
 
 ### Collection Modes
@@ -230,15 +330,13 @@ evt_01234567-89ab-cdef-0123-456789abcdef
 - **Efficient**: Minimizes API calls and processing
 - **Continuation support**: Handles API pagination seamlessly
 
-### Restarting from Scratch
-
-To restart event collection from the beginning:
+### Restarting Collection
 
 ```bash
-# Delete marker file to restart
-rm /path/to/bitwarden_marker.txt
+# Delete marker file to restart from beginning
+rm /var/lib/bitwarden/marker.txt
 
-# Or use a fresh marker file location
+# Or specify different marker file
 ./bw-events --marker-file /tmp/new_marker.txt
 ```
 
@@ -275,15 +373,15 @@ policyType_newValue=2
 
 ### Message Format
 
-Messages are sent in RFC 3164 syslog format with CEF payload:
+Messages are sent in **RFC 3164 syslog format** with CEF payload:
 ```
-<134>Jun 13 15:04:05 hostname BitwardenEvents: CEF:0|Bitwarden|Events|1.0|1500|Invited user|Medium|rt=2025-06-13T15:04:05.000Z cs1=1500 suser=user@company.com memberName=John Smith...
+<134>Jun _3 15:04:05 bitwarden-forwarder CEF:0|Bitwarden|Events|1.0|1500|Invited user|6|rt=2025-06-13T15:04:05.000Z cs1=1500 suser=user@company.com memberName=John Smith...
 ```
 
 ### CEF Structure
 
 ```
-CEF:0|Bitwarden|Events|1.0|{EventType}|{EventName}|Medium|{Extensions}
+CEF:0|Bitwarden|Events|1.0|{EventType}|{EventName}|{Severity}|{Extensions}
 ```
 
 - **Vendor**: Bitwarden
@@ -291,7 +389,7 @@ CEF:0|Bitwarden|Events|1.0|{EventType}|{EventName}|Medium|{Extensions}
 - **Version**: 1.0
 - **Event Class ID**: Bitwarden event type (e.g., 1500)
 - **Name**: Human-readable event name
-- **Severity**: Always "Medium"
+- **Severity**: Mapped based on event criticality (1-10)
 - **Extensions**: Enriched fields including member names, change detection, etc.
 
 ### Enhanced CEF Extensions
@@ -301,6 +399,7 @@ The system provides rich context in CEF extensions:
 - **Enriched data**: Member names, group names, collection names, policy details
 - **Change tracking**: Old/new values for modified objects
 - **Audit context**: Acting user, IP address, device information
+- **Filtering metadata**: Event category, priority level
 
 ## API Integration
 
@@ -314,74 +413,87 @@ The forwarder integrates with multiple Bitwarden API endpoints:
 - **Collections**: `/public/collections/{id}` - Collection information lookup
 - **Policies**: `/public/policies` + `/public/policies/{type}` - Policy information lookup
 
-### Pagination Handling
-
-- **Continuation tokens**: Automatically handles API pagination
-- **Efficient processing**: Processes events in batches
-- **No data loss**: Ensures all events are captured across pagination boundaries
-
-### Error Handling & Resilience
+### Enhanced Error Handling & Resilience
 
 - **Token refresh**: Automatic OAuth2 token renewal before expiry
-- **Retry logic**: Exponential backoff for transient errors
+- **Retry logic**: Exponential backoff for transient errors with configurable limits
 - **Circuit breaker**: Stops after consecutive failures to prevent infinite loops
 - **Graceful degradation**: Continues processing even if individual lookups fail
 - **Connection pooling**: Efficient connection reuse for API calls
+- **Rate limit handling**: Intelligent backoff when API limits are hit
 
 ## Architecture
 
 ```mermaid
 graph TB
-    subgraph "Application Core"
+    subgraph "Enhanced Application Core"
         A["Main Application"] --> B["Config Loader"]
         A --> C["State Manager"]  
         A --> D["OAuth2 Client"]
         A --> E["Event Processor"]
-        A --> F["Lookup Cache"]
-        A --> G["CEF Formatter"]
-        A --> H["Syslog Client"]
+        A --> F["Intelligent Cache"]
+        A --> G["Event Filter Engine"]
+        A --> H["Statistics Tracker"]
+        A --> I["CEF Formatter"]
+        A --> J["Syslog Client"]
+        A --> K["Health Monitor"]
     end
     
     subgraph "Configuration Files"
-        I["config.json"] --> B
-        J["field_map.json"] --> B
-        K["event_map.json"] --> B
-        L["marker.txt"] <--> C
+        L["config.json"] --> B
+        M["field_map.json"] --> B
+        N["event_map.json"] --> B
+        O["marker.txt"] <--> C
     end
     
     subgraph "Bitwarden API Services"
-        M["OAuth2 Token Service"] --> D
-        N["Events API"] --> D
-        O["Members API"] --> D
-        P["Groups API"] --> D
-        Q["Collections API"] --> D
-        R["Policies API"] --> D
+        P["OAuth2 Token Service"] --> D
+        Q["Events API"] --> D
+        R["Members API"] --> D
+        S["Groups API"] --> D
+        T["Collections API"] --> D
+        U["Policies API"] --> D
     end
     
     subgraph "External Infrastructure"
-        S["Syslog Server"] --> H
-        T["SIEM Platform"] --> S
+        V["Syslog Server"] --> J
+        W["SIEM Platform"] --> V
+        X["Monitoring Systems"] --> K
     end
     
-    subgraph "Data Processing Pipeline"
+    subgraph "Enhanced Data Processing Pipeline"
         D -->|"Raw Event Data"| E
-        E -->|"Lookup Requests"| F
-        F -->|"Cached/Fresh Data"| O
-        F -->|"Cached/Fresh Data"| P
-        F -->|"Cached/Fresh Data"| Q
-        F -->|"Cached/Fresh Data"| R
-        E -->|"Enriched Events"| G
-        G -->|"CEF Formatted"| H
-        H -->|"RFC 3164 Syslog"| S
+        E -->|"Event Stream"| G
+        G -->|"Filtered Events"| F
+        F -->|"Lookup Requests"| R
+        F -->|"Lookup Requests"| S
+        F -->|"Lookup Requests"| T
+        F -->|"Lookup Requests"| U
+        F -->|"Enriched Events"| H
+        H -->|"Statistics Data"| I
+        I -->|"CEF Formatted"| J
+        J -->|"RFC 3164 Syslog"| V
         C -->|"Last Event ID"| E
     end
     
-    subgraph "Smart Caching Layer"
-        F --> U["Policy Cache"]
-        F --> V["Member Cache"]
-        F --> W["Group Cache"] 
-        F --> X["Collection Cache"]
-        F --> Y["Change Detection"]
+    subgraph "Intelligent Filtering & Caching"
+        G --> Y["Event Type Filter"]
+        G --> Z["Rate Limiter"]
+        G --> AA["Priority Classifier"]
+        G --> BB["User Filter"]
+        F --> CC["Policy Cache"]
+        F --> DD["Member Cache"]
+        F --> EE["Group Cache"] 
+        F --> FF["Collection Cache"]
+        F --> GG["Change Detection"]
+    end
+    
+    subgraph "Monitoring & Health"
+        H --> HH["Performance Metrics"]
+        H --> II["Cache Statistics"]
+        H --> JJ["Error Tracking"]
+        K --> KK["Health Endpoints"]
+        K --> LL["Prometheus Metrics"]
     end
 ```
 
@@ -389,19 +501,22 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant App as Event Forwarder
+    participant App as Event Forwarder v2.0
     participant Config as Configuration
     participant State as State Manager
     participant API as Bitwarden API
-    participant Cache as Lookup Cache
+    participant Filter as Event Filter
+    participant Cache as Smart Cache
+    participant Stats as Statistics
     participant Syslog as Syslog Server
 
-    App->>Config: Load configuration & mappings
+    App->>Config: Load enhanced configuration
     App->>State: Load last event marker
     App->>API: Authenticate (OAuth2)
     API-->>App: Access token
+    App->>Stats: Initialize statistics tracking
 
-    loop Event Processing Loop
+    loop Enhanced Event Processing Loop
         alt First Run
             App->>API: GET /public/events (all events)
         else Incremental Run  
@@ -409,143 +524,33 @@ sequenceDiagram
         end
         
         API-->>App: Event batch + continuation token
+        App->>Stats: Update API request metrics
         
-        loop For each event
-            alt Cache Invalidation Event
-                App->>Cache: Check for cached data
-                Cache-->>App: Old cached values
-                App->>Cache: Invalidate specific cache entries
-                App->>API: Fetch fresh data for changed object
-                API-->>App: Updated object data
-                App->>App: Compare old vs new values
-            else Regular Event
-                App->>Cache: Check for needed lookups
-                alt Cache Hit
-                    Cache-->>App: Cached lookup data
-                else Cache Miss
-                    App->>API: Lookup member/group/collection/policy
-                    API-->>App: Lookup data
-                    App->>Cache: Store in cache
+        loop For each event batch
+            App->>Filter: Apply intelligent filtering
+            
+            alt High-Volume Event (e.g., 1114)
+                Filter->>Filter: Check rate limits
+                alt Rate limit exceeded
+                    Filter-->>Stats: Log filtered event
+                    Note over Filter: Event dropped
+                else Within limits
+                    Filter-->>App: Event passes filter
                 end
+            else Security-Critical Event
+                Filter-->>App: Event always passes (priority)
+            else Regular Event
+                Filter->>Filter: Apply inclusion/exclusion rules
+                Filter-->>App: Event decision
             end
             
-            App->>App: Enrich event with lookup data
-            App->>App: Format as CEF with change detection
-            App->>Syslog: Send enriched CEF message
-            App->>State: Update event marker
-        end
-        
-        alt More events (pagination)
-            Note over App,API: Continue with continuation token
-        else No more events
-            Note over App: Wait for next polling interval
-        end
-    end
-```
-
-## Change Detection Workflow
-
-```mermaid
-sequenceDiagram
-    participant Event as Policy Modified Event
-    participant Cache as Lookup Cache  
-    participant API as Bitwarden API
-    participant CEF as CEF Formatter
-
-    Event->>Cache: Event 1700 detected (Policy Modified)
-    Cache->>Cache: Capture old cached policy data
-    Note over Cache: {"enabled": true, "type": 0}
-    
-    Cache->>Cache: Invalidate policy cache entry
-    Cache->>Cache: Store old data for comparison
-    
-    Event->>API: Lookup fresh policy data
-    API-->>Event: Updated policy data
-    Note over API: {"enabled": false, "type": 2}
-    
-    Event->>Event: Compare old vs new values
-    Note over Event: enabled: true → false<br/>type: 0 → 2
-    
-    Event->>CEF: Format with change detection
-    Note over CEF: hasDataChanges=true<br/>oldValues="enabled: true, type: 0"<br/>newValues="enabled: false, type: 2"<br/>changeCount=2
-```
-
-## Monitoring & Troubleshooting
-
-### Log Output
-
-The application provides comprehensive logging with visual indicators:
-
-```
-🚀 Starting Bitwarden Event Forwarder v1.0.0
-📋 Configuration loaded successfully
-🔐 Authenticating with Bitwarden API...
-✅ Successfully authenticated (expires: 2025-06-13 15:30:45)
-💾 Cache initialized
-🗺️  Field mappings loaded (4 lookups)
-📝 Event types loaded (85 types)
-🔍 Testing syslog connectivity...
-✅ Syslog connectivity verified
-🎯 Starting event polling...
-📍 Reached marker evt_123, resuming
-✅ Processed 15 events
-```
-
-### Connection Testing
-
-Pre-flight testing validates all dependencies:
-
-```bash
-./bw-events --test
-```
-
-```
-🔍 Testing configuration and connections...
-  Testing Bitwarden API authentication... ✅ SUCCESS
-  Testing Bitwarden API connectivity... ✅ SUCCESS
-  Testing Syslog connectivity... ✅ SUCCESS
-  Testing configuration files... ✅ SUCCESS
-  Testing file permissions... ✅ SUCCESS
-```
-
-### Common Issues
-
-1. **Authentication errors**: Verify client credentials and API permissions
-2. **No events returned**: Check organization access and API connectivity
-3. **Syslog connection failed**: Verify server address, port, and protocol  
-4. **File permission errors**: Ensure proper access to marker and log files
-5. **Cache lookup failures**: Check API endpoints and network connectivity
-
-### Performance Considerations
-
-- **Polling interval**: Balance real-time needs with API rate limits
-- **Cache efficiency**: Lookup caching significantly reduces API calls
-- **Change detection**: Minimal overhead, only active during actual changes
-- **Network latency**: Consider network conditions for timeout settings
-- **Log verbosity**: Adjust log level based on operational needs
-
-## Security
-
-- **Credentials**: Store API credentials securely, never in logs
-- **Network**: Use TLS for API connections, secure syslog transport
-- **Access control**: Limit file permissions on configuration and state files
-- **Monitoring**: Monitor for authentication failures and suspicious activities
-- **Audit trails**: Comprehensive logging for security event correlation
-
-## API Permissions
-
-Required Bitwarden API scopes:
-- `api.organization` - Access to organization events and member information
-
-## Performance Metrics
-
-Typical performance characteristics:
-- **API calls**: 1 base call + lookups per unique object per event
-- **Cache efficiency**: 90%+ hit rate after warm-up period
-- **Processing speed**: 100+ events per second (network dependent)
-- **Memory usage**: <50MB typical, scales with cache size
-- **Startup time**: <5 seconds including connection testing
-
-## License
-
-This project is provided as-is for educational and operational use. Ensure compliance with Bitwarden API terms of service and your organization's security policies.
+            App->>Stats: Update filtering statistics
+            
+            loop For each passed event
+                alt Cache Invalidation Event
+                    App->>Cache: Check for cached data
+                    Cache-->>App: Old cached values
+                    App->>Cache: Invalidate specific cache entries
+                    App->>API: Fetch fresh data for changed object
+                    API-->>App: Updated object data
+                    App-

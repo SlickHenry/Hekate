@@ -114,6 +114,57 @@
     "1301": ["collectionId"],
     "1302": ["collectionId"]
   },
+  "event_filtering": {
+    "mode": "exclude",
+    "excluded_events": [
+      "1114",
+      "1107",
+      "1108",
+      "1109",
+      "1110",
+      "1111",
+      "1112",
+      "1113",
+      "1117"
+    ],
+    "included_events": [],
+    "rate_limiting": {
+      "1114": {"max_per_hour": 10, "enabled": true},
+      "1107": {"max_per_hour": 50, "enabled": true},
+      "1111": {"max_per_hour": 20, "enabled": true},
+      "1100": {"max_per_hour": 100, "enabled": true},
+      "1101": {"max_per_hour": 100, "enabled": true}
+    },
+    "priority_events": [
+      "1000",
+      "1001",
+      "1002",
+      "1005",
+      "1006",
+      "1500",
+      "1501",
+      "1502",
+      "1503",
+      "1515",
+      "1516",
+      "1700",
+      "1600",
+      "1601",
+      "1604",
+      "1605"
+    ],
+    "user_filtering": {
+      "exclude_service_accounts": true,
+      "exclude_users": [],
+      "include_only_users": []
+    }
+  },
+  "statistics": {
+    "enable_detailed_logging": true,
+    "log_interval_events": 100,
+    "track_cache_metrics": true,
+    "track_performance_metrics": true
+  },
   "cef_vendor": "Bitwarden",
   "cef_product": "Events",
   "cef_version": "1.0"

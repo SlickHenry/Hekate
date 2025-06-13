@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -20,349 +21,1286 @@ import (
 	"time"
 )
 
-const (
-	Version     = "1.0.0"
-	BuildDate   = "2025-06-13"
-	UserAgent   = "BitwardenEventForwarder/1.0.0"
-	DefaultPort = "514"
-)
-
-// Configuration holds all application configuration
+// Configuration holds all the program configuration
 type Configuration struct {
-	APIBaseURL      string `json:"api_base_url"`
-	IdentityURL     string `json:"identity_url"`
-	ClientID        string `json:"client_id"`
-	ClientSecret    string `json:"client_secret"`
-	SyslogProtocol  string `json:"syslog_protocol"`
-	SyslogServer    string `json:"syslog_server"`
-	SyslogPort      string `json:"syslog_port"`
-	FetchInterval   int    `json:"fetch_interval"`
-	LogLevel        string `json:"log_level"`
-	MaxMsgSize      int    `json:"max_msg_size"`
-	MaxPagination   int    `json:"max_pagination"`
-	LogFile         string `json:"log_file"`
-	ConnTimeout     int    `json:"conn_timeout"`
-	MarkerFile      string `json:"marker_file"`
-	FieldMapFile    string `json:"field_map_file"`
-	EventMapFile    string `json:"event_map_file"`
+	APIBaseURL         string
+	IdentityURL        string
+	ClientID           string
+	ClientSecret       string
+	SyslogProtocol     string
+	SyslogServer       string
+	SyslogPort         string
+	LogLevel           string
+	LogFile            string
+	FetchInterval      int
+	ConnTimeout        int
+	MaxMsgSize         int
+	MarkerFile         string
+	FieldMapFile       string
+	EventMapFile       string
+	Verbose            bool
+	MaxRetries         int
+	RetryDelay         int
+	MaxBackoffDelay    int
+	HealthCheckPort    int
+	TestMode           bool
+	ValidateMode       bool
+	ShowVersion        bool
 }
 
-// OAuth2Token represents an OAuth2 access token
-type OAuth2Token struct {
-	AccessToken string    `json:"access_token"`
-	ExpiresIn   int       `json:"expires_in"`
-	TokenType   string    `json:"token_type"`
-	Expiry      time.Time `json:"-"`
+// Enhanced FieldMapping with filtering and statistics
+type FieldMapping struct {
+	OrderedFields          []string                    `json:"ordered_fields"`
+	FieldMappings          map[string]string           `json:"field_mappings"`
+	Lookups                map[string]LookupConfig     `json:"lookups"`
+	CacheInvalidationRules map[string][]string         `json:"cache_invalidation_rules"`
+	EventFiltering         EventFilter                 `json:"event_filtering"`
+	Statistics             StatisticsConfig            `json:"statistics"`
+	CEFVendor              string                      `json:"cef_vendor"`
+	CEFProduct             string                      `json:"cef_product"`
+	CEFVersion             string                      `json:"cef_version"`
 }
 
-// Event represents a Bitwarden event log entry
-type Event struct {
-	ID            string                 `json:"id"`
-	MemberID      string                 `json:"memberId"`
-	ActingUserID  string                 `json:"actingUserId"`
-	Type          int                    `json:"type"`
-	Date          string                 `json:"date"`
-	ItemID        string                 `json:"itemId"`
-	CollectionID  string                 `json:"collectionId"`
-	GroupID       string                 `json:"groupId"`
-	PolicyID      string                 `json:"policyId"`
-	Device        int                    `json:"device"`
-	IPAddress     string                 `json:"ipAddress"`
-	Details       map[string]interface{} `json:"-"`
+// EventFilter holds comprehensive filtering configuration
+type EventFilter struct {
+	Mode               string                  `json:"mode"`                // "include", "exclude", or "all"
+	ExcludedEvents     []string                `json:"excluded_events"`     // Event types to exclude
+	IncludedEvents     []string                `json:"included_events"`     // Event types to include
+	RateLimiting       map[string]RateLimit    `json:"rate_limiting"`       // Rate limiting per event type
+	PriorityEvents     []string                `json:"priority_events"`     // Always include these events
+	UserFiltering      UserFilter              `json:"user_filtering"`      // User-based filtering
 }
 
-// EventsResponse represents the API response for events
-type EventsResponse struct {
-	Object            string  `json:"object"`
-	Data              []Event `json:"data"`
-	ContinuationToken string  `json:"continuationToken"`
+// RateLimit defines rate limiting rules for specific event types
+type RateLimit struct {
+	MaxPerHour int  `json:"max_per_hour"`
+	Enabled    bool `json:"enabled"`
 }
 
-// LookupRule defines how to perform lookups and map response fields
-type LookupRule struct {
+// UserFilter defines user-based filtering rules  
+type UserFilter struct {
+	ExcludeServiceAccounts bool     `json:"exclude_service_accounts"`
+	ExcludeUsers          []string `json:"exclude_users"`
+	IncludeOnlyUsers      []string `json:"include_only_users"`
+}
+
+// StatisticsConfig controls statistics collection and reporting
+type StatisticsConfig struct {
+	EnableDetailedLogging   bool `json:"enable_detailed_logging"`
+	LogIntervalEvents       int  `json:"log_interval_events"`
+	TrackCacheMetrics       bool `json:"track_cache_metrics"`
+	TrackPerformanceMetrics bool `json:"track_performance_metrics"`
+}
+
+// LookupConfig defines how to lookup and cache external data
+type LookupConfig struct {
 	Endpoint        string            `json:"endpoint"`
 	ResponseMapping map[string]string `json:"response_mapping"`
 }
 
-// FieldMapping defines how to map and enrich event fields
-type FieldMapping struct {
-	OrderedFields          []string                    `json:"ordered_fields"`
-	FieldMappings          map[string]string          `json:"field_mappings"`
-	Lookups                map[string]LookupRule      `json:"lookups"`
-	CacheInvalidationRules map[int][]string           `json:"cache_invalidation_rules"`
-	CEFVendor              string                     `json:"cef_vendor"`
-	CEFProduct             string                     `json:"cef_product"`
-	CEFVersion             string                     `json:"cef_version"`
+// ServiceStats tracks comprehensive service health metrics
+type ServiceStats struct {
+	sync.RWMutex
+	StartTime              time.Time
+	LastSuccessfulRun      time.Time
+	TotalEventsForwarded   int64
+	TotalEventsFiltered    int64
+	TotalEventsDropped     int64
+	TotalAPIRequests       int64
+	FailedAPIRequests      int64
+	TotalRetryAttempts     int64
+	SuccessfulRecoveries   int64
+	SyslogReconnects       int64
+	CacheHits              int64
+	CacheMisses            int64
+	LookupFailures         int64
+	ChangeDetectionEvents  int64
+	MarkerFileUpdates      int64
+	LastError              string
+	LastErrorTime          time.Time
+	LastMarker             string
+	CurrentPollDuration    time.Duration
+	AverageEventsPerSecond float64
 }
 
-// LookupCache provides thread-safe caching for API lookups
+// RateLimitTracker tracks rate limits per event type
+type RateLimitTracker struct {
+	sync.RWMutex
+	EventCounts map[string][]time.Time // event_type -> timestamps
+}
+
+// OAuthToken represents an OAuth2 access token
+type OAuthToken struct {
+	AccessToken string    `json:"access_token"`
+	TokenType   string    `json:"token_type"`
+	ExpiresIn   int       `json:"expires_in"`
+	ExpiresAt   time.Time `json:"-"`
+}
+
+// BitwardenEvent represents a Bitwarden event
+type BitwardenEvent struct {
+	ID           string                 `json:"id"`
+	Type         int                    `json:"type"`
+	Date         time.Time              `json:"date"`
+	MemberID     *string                `json:"memberId"`
+	ActingUserID *string                `json:"actingUserId"`
+	IPAddress    string                 `json:"ipAddress"`
+	Device       string                 `json:"device"`
+	GroupID      *string                `json:"groupId"`
+	CollectionID *string                `json:"collectionId"`
+	PolicyID     *int                   `json:"policyId"`
+	Object       string                 `json:"object"`
+}
+
+// SyslogWriter manages a resilient connection to a syslog server
+type SyslogWriter struct {
+	protocol       string
+	address        string
+	conn           net.Conn
+	reconnectCount int
+	lastReconnect  time.Time
+	maxReconnects  int
+	reconnectDelay time.Duration
+}
+
+// Cache for lookup data
 type LookupCache struct {
-	mu    sync.RWMutex
-	cache map[string]map[string]interface{}
+	sync.RWMutex
+	data map[string]map[string]interface{}
 }
 
-// NewLookupCache creates a new lookup cache
-func NewLookupCache() *LookupCache {
-	return &LookupCache{
-		cache: make(map[string]map[string]interface{}),
-	}
+// Statistics structures for tracking
+type CacheStats struct {
+	Hits   int
+	Misses int
 }
 
-// Get retrieves a cached value
-func (lc *LookupCache) Get(cacheKey, id string) (map[string]interface{}, bool) {
-	lc.mu.RLock()
-	defer lc.mu.RUnlock()
-	
-	typeCache, ok := lc.cache[cacheKey]
-	if !ok {
-		return nil, false
-	}
-	
-	data, ok := typeCache[id]
-	if !ok {
-		return nil, false
-	}
-	
-	return data, true
+type LookupStats struct {
+	Failures int
+	Success  int
 }
 
-// Set stores a value in the cache
-func (lc *LookupCache) Set(cacheKey, id string, data map[string]interface{}) {
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	
-	if lc.cache[cacheKey] == nil {
-		lc.cache[cacheKey] = make(map[string]interface{})
-	}
-	lc.cache[cacheKey][id] = data
+type ChangeStats struct {
+	ChangeEvents int
 }
+
+var (
+	serviceStats     = &ServiceStats{StartTime: time.Now()}
+	rateLimitTracker = &RateLimitTracker{EventCounts: make(map[string][]time.Time)}
+	lookupCache      = &LookupCache{data: make(map[string]map[string]interface{})}
+	ctx              context.Context
+	cancel           context.CancelFunc
+	currentToken     *OAuthToken
+	eventTypeMap     map[string]string
+)
 
 func main() {
-	cfg := loadConfig()
-
-	if err := setupLogging(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to setup logging: %v\n", err)
-		os.Exit(1)
-	}
-
-	log.Printf("🚀 Starting Bitwarden Event Forwarder v%s", Version)
-	log.Printf("📋 Configuration loaded successfully")
-	log.Printf("🔗 API Base URL: %s", cfg.APIBaseURL)
-	log.Printf("📡 Syslog: %s://%s:%s", cfg.SyslogProtocol, cfg.SyslogServer, cfg.SyslogPort)
-	log.Printf("⏱️  Fetch Interval: %d seconds", cfg.FetchInterval)
-
-	ctx, cancel := context.WithCancel(context.Background())
+	// Create cancellable context for graceful shutdown
+	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 
-	// Setup signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
-	go func() {
-		sig := <-sigChan
-		log.Printf("🛑 Received shutdown signal (%s), exiting gracefully...", sig)
-		cancel()
-		os.Exit(0)
-	}()
+	config := loadConfig()
 
-	// Initialize OAuth2 token
-	log.Printf("🔐 Authenticating with Bitwarden API...")
-	token, err := fetchOAuth2TokenWithRetry(cfg, 3)
+	// Handle special modes
+	if config.ShowVersion {
+		fmt.Println("Bitwarden Event Forwarder v2.0.0 - Enhanced with Filtering & Statistics")
+		return
+	}
+
+	if config.ValidateMode {
+		if err := validateConfig(config); err != nil {
+			log.Fatalf("❌ Configuration validation failed: %v", err)
+		}
+		log.Println("✅ Configuration is valid")
+		return
+	}
+
+	if config.TestMode {
+		if err := runConnectionTests(config); err != nil {
+			log.Fatalf("❌ Connection tests failed: %v", err)
+		}
+		log.Println("✅ All connection tests passed")
+		return
+	}
+
+	// Setup logging
+	if err := setupLogging(config); err != nil {
+		log.Fatalf("Failed to setup logging: %v", err)
+	}
+
+	// Log startup information
+	logServiceStartup(config)
+
+	// Validate configuration
+	if err := validateConfig(config); err != nil {
+		log.Fatalf("❌ Configuration validation failed: %v", err)
+	}
+
+	// Load field mappings and event types
+	fieldMapping := loadFieldMapping(config.FieldMapFile)
+	eventTypeMap = loadEventTypeMap(config.EventMapFile)
+
+	// Initialize syslog writer
+	syslogWriter, err := NewSyslogWriter(config.SyslogProtocol,
+		fmt.Sprintf("%s:%s", config.SyslogServer, config.SyslogPort), config)
 	if err != nil {
-		log.Fatalf("❌ Authentication failed: %v", err)
+		log.Fatalf("❌ Failed to initialize syslog connection: %v", err)
 	}
-	log.Printf("✅ Successfully authenticated (expires: %s)", token.Expiry.Format("2006-01-02 15:04:05"))
+	defer syslogWriter.Close()
 
-	// Initialize components
-	cache := NewLookupCache()
-	fieldMapping := loadFieldMapping(cfg.FieldMapFile)
-	eventTypeNames := loadEventTypeNames(cfg.EventMapFile)
+	log.Println("✅ Syslog connectivity verified")
 
-	log.Printf("💾 Cache initialized")
+	// Authenticate with Bitwarden
+	if err := authenticateWithBitwarden(config); err != nil {
+		log.Fatalf("❌ Failed to authenticate with Bitwarden: %v", err)
+	}
+
+	log.Printf("✅ Successfully authenticated (expires: %s)", currentToken.ExpiresAt.Format("2006-01-02 15:04:05"))
+
+	// Initialize cache and load last marker
+	log.Println("💾 Cache initialized")
 	log.Printf("🗺️  Field mappings loaded (%d lookups)", len(fieldMapping.Lookups))
-	log.Printf("📝 Event types loaded (%d types)", len(eventTypeNames))
+	log.Printf("📝 Event types loaded (%d types)", len(eventTypeMap))
 
-	// Test syslog connectivity
-	if err := testSyslogConnection(cfg); err != nil {
-		log.Fatalf("❌ Syslog test failed: %v", err)
+	lastMarker := loadMarkerFromFile(config.MarkerFile)
+	if lastMarker != "" {
+		log.Printf("📍 Resuming from marker: %s", lastMarker[:min(len(lastMarker), 20)]+"...")
+	} else {
+		log.Println("🆕 Starting fresh - will collect from oldest available events")
 	}
-	log.Printf("✅ Syslog connectivity verified")
 
-	// Start event polling
-	log.Printf("🎯 Starting event polling...")
-	pollEventsWithErrorRecovery(ctx, cfg, &token, cache, fieldMapping, eventTypeNames)
+	// Start health check server if configured
+	if config.HealthCheckPort > 0 {
+		go startHealthCheckServer(config.HealthCheckPort)
+		log.Printf("🏥 Health check server started on port %d", config.HealthCheckPort)
+	}
+
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+
+	log.Println("🎯 Starting event polling...")
+
+	// Main service loop with exponential backoff on failures
+	ticker := time.NewTicker(time.Duration(config.FetchInterval) * time.Second)
+	defer ticker.Stop()
+
+	backoffDelay := 1 * time.Second
+	maxBackoff := time.Duration(config.MaxBackoffDelay) * time.Second
+
+	// Process initial events
+	processEventsWithRecovery(config, fieldMapping, syslogWriter, lastMarker)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Context cancelled, shutting down...")
+			return
+
+		case <-ticker.C:
+			success := processEventsWithRecovery(config, fieldMapping, syslogWriter, lastMarker)
+
+			if success {
+				// Reset backoff on success
+				backoffDelay = 1 * time.Second
+				ticker.Reset(time.Duration(config.FetchInterval) * time.Second)
+			} else {
+				// Apply exponential backoff on failure
+				log.Printf("⏰ Processing failed, backing off for %v", backoffDelay)
+				ticker.Reset(backoffDelay)
+				backoffDelay *= 2
+				if backoffDelay > maxBackoff {
+					backoffDelay = maxBackoff
+				}
+			}
+
+		case sig := <-sigChan:
+			log.Printf("📨 Received signal %v, initiating graceful shutdown...", sig)
+
+			if sig == syscall.SIGHUP {
+				log.Println("🔄 SIGHUP received - reloading configuration")
+				fieldMapping = loadFieldMapping(config.FieldMapFile)
+				eventTypeMap = loadEventTypeMap(config.EventMapFile)
+				log.Println("✅ Configuration reloaded")
+				continue
+			}
+
+			log.Println("💾 Saving final state and shutting down...")
+			cancel()
+			return
+		}
+	}
 }
 
-// loadConfig loads configuration from flags, environment, and files
 func loadConfig() Configuration {
-	var (
-		showHelp     = flag.Bool("help", false, "Show help message")
-		showVersion  = flag.Bool("version", false, "Show version information")
-		configFile   = flag.String("config", getEnvOrDefault("BW_CONFIG_FILE", ""), "Configuration file path")
-		validateOnly = flag.Bool("validate", false, "Validate configuration and exit")
-		testMode     = flag.Bool("test", false, "Test connections and exit")
-	)
-
-	// Define all configuration flags
-	cfg := Configuration{
-		APIBaseURL:     *flag.String("api-url", getEnvOrDefault("BW_API_URL", "https://api.bitwarden.com"), "Bitwarden API base URL"),
-		IdentityURL:    *flag.String("identity-url", getEnvOrDefault("BW_IDENTITY_URL", "https://identity.bitwarden.com"), "Bitwarden Identity URL"),
-		ClientID:       *flag.String("client-id", getEnvOrDefault("BW_CLIENT_ID", ""), "Bitwarden API Client ID"),
-		ClientSecret:   *flag.String("client-secret", getEnvOrDefault("BW_CLIENT_SECRET", ""), "Bitwarden API Client Secret"),
-		SyslogProtocol: *flag.String("syslog-proto", getEnvOrDefault("SYSLOG_PROTOCOL", "tcp"), "Syslog protocol (tcp/udp)"),
-		SyslogServer:   *flag.String("syslog-server", getEnvOrDefault("SYSLOG_SERVER", "localhost"), "Syslog server address"),
-		SyslogPort:     *flag.String("syslog-port", getEnvOrDefault("SYSLOG_PORT", DefaultPort), "Syslog server port"),
-		FetchInterval:  *flag.Int("interval", getEnvOrIntDefault("FETCH_INTERVAL", 60), "Event fetch interval in seconds"),
-		LogLevel:       *flag.String("log-level", getEnvOrDefault("LOG_LEVEL", "info"), "Log level"),
-		MaxMsgSize:     *flag.Int("max-msg-size", getEnvOrIntDefault("MAX_MSG_SIZE", 8192), "Maximum syslog message size"),
-		MaxPagination:  *flag.Int("max-pagination", getEnvOrIntDefault("MAX_PAGINATION", 50), "Maximum pagination requests"),
-		LogFile:        *flag.String("log-file", getEnvOrDefault("LOG_FILE", ""), "Log file path"),
-		ConnTimeout:    *flag.Int("conn-timeout", getEnvOrIntDefault("CONNECTION_TIMEOUT", 30), "Connection timeout in seconds"),
-		MarkerFile:     *flag.String("marker-file", getEnvOrDefault("MARKER_FILE", "./bitwarden_marker.txt"), "Marker file path"),
-		FieldMapFile:   *flag.String("field-map", getEnvOrDefault("FIELD_MAP_FILE", "./bitwarden_field_map.json"), "Field mapping file"),
-		EventMapFile:   *flag.String("event-map", getEnvOrDefault("EVENT_MAP_FILE", "./bitwarden_event_map.json"), "Event mapping file"),
-	}
+	// Command line flags
+	apiURL := flag.String("api-url", getEnvOrDefault("BW_API_URL", "https://api.bitwarden.com"), "Bitwarden API base URL")
+	identityURL := flag.String("identity-url", getEnvOrDefault("BW_IDENTITY_URL", "https://identity.bitwarden.com"), "Bitwarden Identity URL")
+	clientID := flag.String("client-id", getEnvOrDefault("BW_CLIENT_ID", ""), "Bitwarden API Client ID")
+	clientSecret := flag.String("client-secret", getEnvOrDefault("BW_CLIENT_SECRET", ""), "Bitwarden API Client Secret")
+	syslogProto := flag.String("syslog-proto", getEnvOrDefault("SYSLOG_PROTOCOL", "tcp"), "Syslog protocol (tcp/udp)")
+	syslogServer := flag.String("syslog-server", getEnvOrDefault("SYSLOG_SERVER", "localhost"), "Syslog server address")
+	syslogPort := flag.String("syslog-port", getEnvOrDefault("SYSLOG_PORT", "514"), "Syslog server port")
+	logLevel := flag.String("log-level", getEnvOrDefault("LOG_LEVEL", "info"), "Log level")
+	logFile := flag.String("log-file", getEnvOrDefault("LOG_FILE", ""), "Log file path")
+	fetchInterval := flag.Int("interval", getEnvOrIntDefault("FETCH_INTERVAL", 60), "Event fetch interval in seconds")
+	connTimeout := flag.Int("conn-timeout", getEnvOrIntDefault("CONNECTION_TIMEOUT", 30), "Connection timeout in seconds")
+	maxMsgSize := flag.Int("max-msg-size", getEnvOrIntDefault("MAX_MSG_SIZE", 8192), "Maximum syslog message size")
+	markerFile := flag.String("marker-file", getEnvOrDefault("MARKER_FILE", "bitwarden_marker.txt"), "Event marker file")
+	fieldMapFile := flag.String("field-map", getEnvOrDefault("FIELD_MAP_FILE", "bitwarden_field_map.json"), "Field mapping file")
+	eventMapFile := flag.String("event-map", getEnvOrDefault("EVENT_MAP_FILE", "bitwarden_event_map.json"), "Event type mapping file")
+	verbose := flag.Bool("verbose", getEnvOrBoolDefault("VERBOSE", false), "Enable verbose output")
+	maxRetries := flag.Int("max-retries", getEnvOrIntDefault("MAX_RETRIES", 3), "Maximum retry attempts")
+	retryDelay := flag.Int("retry-delay", getEnvOrIntDefault("RETRY_DELAY", 5), "Retry delay in seconds")
+	maxBackoffDelay := flag.Int("max-backoff", getEnvOrIntDefault("MAX_BACKOFF_DELAY", 300), "Maximum backoff delay in seconds")
+	healthCheckPort := flag.Int("health-port", getEnvOrIntDefault("HEALTH_CHECK_PORT", 8080), "Health check port (0 to disable)")
+	testMode := flag.Bool("test", false, "Test connections and dependencies")
+	validateMode := flag.Bool("validate", false, "Validate configuration and exit")
+	showVersion := flag.Bool("version", false, "Show version information")
 
 	flag.Parse()
 
-	if *showHelp {
-		showHelpMessage()
-		os.Exit(0)
+	return Configuration{
+		APIBaseURL:      *apiURL,
+		IdentityURL:     *identityURL,
+		ClientID:        *clientID,
+		ClientSecret:    *clientSecret,
+		SyslogProtocol:  *syslogProto,
+		SyslogServer:    *syslogServer,
+		SyslogPort:      *syslogPort,
+		LogLevel:        *logLevel,
+		LogFile:         *logFile,
+		FetchInterval:   *fetchInterval,
+		ConnTimeout:     *connTimeout,
+		MaxMsgSize:      *maxMsgSize,
+		MarkerFile:      *markerFile,
+		FieldMapFile:    *fieldMapFile,
+		EventMapFile:    *eventMapFile,
+		Verbose:         *verbose,
+		MaxRetries:      *maxRetries,
+		RetryDelay:      *retryDelay,
+		MaxBackoffDelay: *maxBackoffDelay,
+		HealthCheckPort: *healthCheckPort,
+		TestMode:        *testMode,
+		ValidateMode:    *validateMode,
+		ShowVersion:     *showVersion,
 	}
-
-	if *showVersion {
-		showVersionInfo()
-		os.Exit(0)
-	}
-
-	// Load config file if specified
-	if *configFile != "" {
-		if err := loadConfigFromFile(&cfg, *configFile); err != nil {
-			log.Fatalf("Failed to load config file: %v", err)
-		}
-	}
-
-	// Validate configuration
-	if err := validateConfiguration(cfg); err != nil {
-		log.Fatalf("Configuration validation failed: %v", err)
-	}
-
-	if *validateOnly {
-		fmt.Println("✅ Configuration validation passed")
-		os.Exit(0)
-	}
-
-	if *testMode {
-		if err := testConnections(cfg); err != nil {
-			log.Fatalf("Connection test failed: %v", err)
-		}
-		fmt.Println("✅ All connection tests passed")
-		os.Exit(0)
-	}
-
-	return cfg
 }
 
-// getEnvOrDefault returns environment variable value or default
-func getEnvOrDefault(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
+func validateConfig(config Configuration) error {
+	missing := []string{}
+	if config.ClientID == "" {
+		missing = append(missing, "BW_CLIENT_ID")
 	}
-	return defaultValue
-}
-
-// getEnvOrIntDefault returns environment variable as int or default
-func getEnvOrIntDefault(key string, defaultValue int) int {
-	if value, exists := os.LookupEnv(key); exists {
-		var result int
-		if n, err := fmt.Sscanf(value, "%d", &result); err == nil && n == 1 {
-			return result
-		}
+	if config.ClientSecret == "" {
+		missing = append(missing, "BW_CLIENT_SECRET")
 	}
-	return defaultValue
-}
-
-// setupLogging configures logging output
-func setupLogging(cfg Configuration) error {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
-	if cfg.LogFile == "" {
-		return nil
+	if config.SyslogServer == "" {
+		missing = append(missing, "SYSLOG_SERVER")
 	}
-
-	if err := os.MkdirAll(filepath.Dir(cfg.LogFile), 0755); err != nil {
-		return fmt.Errorf("create log directory: %w", err)
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required configuration: %v", missing)
 	}
-
-	file, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("open log file: %w", err)
+	if config.FetchInterval < 10 {
+		return fmt.Errorf("fetch interval must be at least 10 seconds")
 	}
-
-	log.SetOutput(io.MultiWriter(os.Stdout, file))
 	return nil
 }
 
-// fetchOAuth2Token gets an OAuth2 token from Bitwarden
-func fetchOAuth2Token(cfg Configuration) (OAuth2Token, error) {
-	form := fmt.Sprintf("grant_type=client_credentials&scope=api.organization&client_id=%s&client_secret=%s",
-		cfg.ClientID, cfg.ClientSecret)
+func setupLogging(config Configuration) error {
+	var writers []io.Writer
+	writers = append(writers, os.Stdout)
 
-	req, err := http.NewRequest(http.MethodPost, cfg.IdentityURL+"/connect/token", strings.NewReader(form))
+	if config.LogFile != "" {
+		dir := filepath.Dir(config.LogFile)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create log directory: %w", err)
+		}
+
+		file, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open log file: %w", err)
+		}
+		writers = append(writers, file)
+	}
+
+	if len(writers) > 1 {
+		log.SetOutput(io.MultiWriter(writers...))
+	} else {
+		log.SetOutput(writers[0])
+	}
+
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	return nil
+}
+
+func logServiceStartup(config Configuration) {
+	log.Printf("🚀 Starting Bitwarden Event Forwarder v2.0.0")
+	log.Printf("📋 PID: %d", os.Getpid())
+	log.Printf("🔐 API: %s", config.APIBaseURL)
+	log.Printf("📡 Syslog: %s:%s (%s)", config.SyslogServer, config.SyslogPort, config.SyslogProtocol)
+	log.Printf("⏱️  Interval: %ds", config.FetchInterval)
+	log.Printf("📁 Marker: %s", config.MarkerFile)
+	log.Printf("🗺️  Field Map: %s", config.FieldMapFile)
+	log.Printf("📝 Event Map: %s", config.EventMapFile)
+}
+
+func runConnectionTests(config Configuration) error {
+	log.Println("🔍 Testing configuration and connections...")
+
+	// Test Bitwarden API authentication
+	log.Print("  Testing Bitwarden API authentication... ")
+	if err := authenticateWithBitwarden(config); err != nil {
+		log.Printf("❌ FAILED: %v", err)
+		return err
+	}
+	log.Println("✅ SUCCESS")
+
+	// Test Bitwarden API connectivity
+	log.Print("  Testing Bitwarden API connectivity... ")
+	if err := testBitwardenAPI(config); err != nil {
+		log.Printf("❌ FAILED: %v", err)
+		return err
+	}
+	log.Println("✅ SUCCESS")
+
+	// Test Syslog connectivity
+	log.Print("  Testing Syslog connectivity... ")
+	writer, err := NewSyslogWriter(config.SyslogProtocol, 
+		fmt.Sprintf("%s:%s", config.SyslogServer, config.SyslogPort), config)
 	if err != nil {
-		return OAuth2Token{}, fmt.Errorf("create request: %w", err)
+		log.Printf("❌ FAILED: %v", err)
+		return err
+	}
+	writer.Close()
+	log.Println("✅ SUCCESS")
+
+	// Test configuration files
+	log.Print("  Testing configuration files... ")
+	if err := testConfigFiles(config); err != nil {
+		log.Printf("❌ FAILED: %v", err)
+		return err
+	}
+	log.Println("✅ SUCCESS")
+
+	// Test file permissions
+	log.Print("  Testing file permissions... ")
+	if err := testFilePermissions(config); err != nil {
+		log.Printf("❌ FAILED: %v", err)
+		return err
+	}
+	log.Println("✅ SUCCESS")
+
+	return nil
+}
+
+func NewSyslogWriter(protocol, address string, config Configuration) (*SyslogWriter, error) {
+	conn, err := net.DialTimeout(protocol, address, time.Duration(config.ConnTimeout)*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to syslog server: %w", err)
+	}
+
+	return &SyslogWriter{
+		protocol:       protocol,
+		address:        address,
+		conn:           conn,
+		maxReconnects:  10,
+		reconnectDelay: 5 * time.Second,
+	}, nil
+}
+
+func (w *SyslogWriter) Write(message string) error {
+	if w.conn == nil {
+		return fmt.Errorf("no connection available")
+	}
+	_, err := fmt.Fprintln(w.conn, message)
+	return err
+}
+
+func (w *SyslogWriter) Close() error {
+	if w.conn != nil {
+		return w.conn.Close()
+	}
+	return nil
+}
+
+func (w *SyslogWriter) Reconnect() error {
+	if time.Since(w.lastReconnect) < w.reconnectDelay {
+		return fmt.Errorf("reconnection rate limited")
+	}
+
+	if w.reconnectCount >= w.maxReconnects {
+		return fmt.Errorf("max reconnection attempts exceeded")
+	}
+
+	if w.conn != nil {
+		w.conn.Close()
+	}
+
+	conn, err := net.DialTimeout(w.protocol, w.address, 30*time.Second)
+	if err != nil {
+		w.reconnectCount++
+		w.lastReconnect = time.Now()
+		serviceStats.Lock()
+		serviceStats.SyslogReconnects++
+		serviceStats.Unlock()
+		return fmt.Errorf("failed to reconnect to syslog server: %w", err)
+	}
+
+	w.conn = conn
+	w.reconnectCount = 0
+	w.lastReconnect = time.Now()
+	log.Printf("✅ Successfully reconnected to syslog server")
+	return nil
+}
+
+func authenticateWithBitwarden(config Configuration) error {
+	tokenURL := config.IdentityURL + "/connect/token"
+
+	data := fmt.Sprintf("grant_type=client_credentials&scope=api.organization&client_id=%s&client_secret=%s",
+		config.ClientID, config.ClientSecret)
+
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("error creating auth request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("User-Agent", "Bitwarden-Event-Forwarder/2.0")
 
-	client := &http.Client{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return OAuth2Token{}, fmt.Errorf("request failed: %w", err)
+		return fmt.Errorf("authentication request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
-		return OAuth2Token{}, fmt.Errorf("token request failed (status %d): %s", resp.StatusCode, body)
+		return fmt.Errorf("authentication failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var token OAuth2Token
+	var token OAuthToken
 	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
-		return OAuth2Token{}, fmt.Errorf("decode token: %w", err)
+		return fmt.Errorf("error parsing token response: %w", err)
 	}
 
-	token.Expiry = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second)
-	return token, nil
+	token.ExpiresAt = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second)
+	currentToken = &token
+
+	return nil
 }
 
-// fetchOAuth2TokenWithRetry attempts token fetch with retries
-func fetchOAuth2TokenWithRetry(cfg Configuration, maxRetries int) (OAuth2Token, error) {
+func testBitwardenAPI(config Configuration) error {
+	// Simple test to verify API connectivity
+	req, err := http.NewRequest("GET", config.APIBaseURL+"/public/events", nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+currentToken.AccessToken)
+	req.Header.Set("User-Agent", "Bitwarden-Event-Forwarder/2.0")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("API test returned status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func testConfigFiles(config Configuration) error {
+	// Test field mapping file
+	if _, err := os.Stat(config.FieldMapFile); os.IsNotExist(err) {
+		// Create default field mapping file
+		defaultMapping := createDefaultFieldMapping()
+		if err := saveFieldMapping(config.FieldMapFile, defaultMapping); err != nil {
+			return fmt.Errorf("failed to create default field mapping: %w", err)
+		}
+		log.Printf("📋 Created default field mapping file: %s", config.FieldMapFile)
+	}
+
+	// Test event mapping file - must exist, don't create default
+	if _, err := os.Stat(config.EventMapFile); os.IsNotExist(err) {
+		return fmt.Errorf("event mapping file not found: %s (please provide bitwarden_event_map.json)", config.EventMapFile)
+	}
+
+	return nil
+}
+
+func testFilePermissions(config Configuration) error {
+	// Test marker file permissions
+	dir := filepath.Dir(config.MarkerFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("cannot create marker file directory: %w", err)
+	}
+
+	// Test write permissions
+	testFile := filepath.Join(dir, "test_permissions")
+	if err := ioutil.WriteFile(testFile, []byte("test"), 0644); err != nil {
+		return fmt.Errorf("cannot write to marker file directory: %w", err)
+	}
+	os.Remove(testFile)
+
+	return nil
+}
+
+func startHealthCheckServer(port int) {
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		serviceStats.RLock()
+		status := map[string]interface{}{
+			"status":                "healthy",
+			"uptime":                time.Since(serviceStats.StartTime).String(),
+			"last_successful_run":   serviceStats.LastSuccessfulRun.Format(time.RFC3339),
+			"total_events":          serviceStats.TotalEventsForwarded,
+			"total_filtered":        serviceStats.TotalEventsFiltered,
+			"total_dropped":         serviceStats.TotalEventsDropped,
+			"total_api_requests":    serviceStats.TotalAPIRequests,
+			"failed_api_requests":   serviceStats.FailedAPIRequests,
+			"retry_attempts":        serviceStats.TotalRetryAttempts,
+			"successful_recoveries": serviceStats.SuccessfulRecoveries,
+			"syslog_reconnects":     serviceStats.SyslogReconnects,
+			"cache_hits":            serviceStats.CacheHits,
+			"cache_misses":          serviceStats.CacheMisses,
+			"lookup_failures":       serviceStats.LookupFailures,
+			"change_detection_events": serviceStats.ChangeDetectionEvents,
+			"marker_file_updates":   serviceStats.MarkerFileUpdates,
+			"last_error":            serviceStats.LastError,
+			"last_error_time":       serviceStats.LastErrorTime.Format(time.RFC3339),
+			"average_events_per_second": serviceStats.AverageEventsPerSecond,
+		}
+		serviceStats.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
+	})
+
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		serviceStats.RLock()
+		fmt.Fprintf(w, "bitwarden_forwarder_uptime_seconds %d\n", int64(time.Since(serviceStats.StartTime).Seconds()))
+		fmt.Fprintf(w, "bitwarden_forwarder_total_events %d\n", serviceStats.TotalEventsForwarded)
+		fmt.Fprintf(w, "bitwarden_forwarder_total_filtered %d\n", serviceStats.TotalEventsFiltered)
+		fmt.Fprintf(w, "bitwarden_forwarder_total_dropped %d\n", serviceStats.TotalEventsDropped)
+		fmt.Fprintf(w, "bitwarden_forwarder_api_requests_total %d\n", serviceStats.TotalAPIRequests)
+		fmt.Fprintf(w, "bitwarden_forwarder_api_requests_failed %d\n", serviceStats.FailedAPIRequests)
+		fmt.Fprintf(w, "bitwarden_forwarder_syslog_reconnects %d\n", serviceStats.SyslogReconnects)
+		fmt.Fprintf(w, "bitwarden_forwarder_cache_hits %d\n", serviceStats.CacheHits)
+		fmt.Fprintf(w, "bitwarden_forwarder_cache_misses %d\n", serviceStats.CacheMisses)
+		serviceStats.RUnlock()
+	})
+
+	server := &http.Server{
+		Addr:         fmt.Sprintf(":%d", port),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("❌ Health check server error: %v", err)
+	}
+}
+
+func processEventsWithRecovery(config Configuration, fieldMapping FieldMapping, syslogWriter *SyslogWriter, lastMarker string) bool {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("🚨 PANIC recovered in processEvents: %v", r)
+			serviceStats.Lock()
+			serviceStats.LastError = fmt.Sprintf("PANIC: %v", r)
+			serviceStats.LastErrorTime = time.Now()
+			serviceStats.Unlock()
+		}
+	}()
+
+	err := processAllEventsWithStats(config, fieldMapping, syslogWriter, lastMarker)
+	if err != nil {
+		log.Printf("❌ Error processing events: %v", err)
+		serviceStats.Lock()
+		serviceStats.LastError = err.Error()
+		serviceStats.LastErrorTime = time.Now()
+		serviceStats.FailedAPIRequests++
+		serviceStats.Unlock()
+		return false
+	}
+
+	return true
+}
+
+func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, syslogWriter *SyslogWriter, lastMarker string) error {
+	// Poll period tracking
+	pollStart := time.Now()
+	var pollEnd time.Time
+	
+	totalEventsProcessed := 0
+	totalEventsFiltered := 0
+	totalEventsDropped := 0
+	numErrors := 0
+	totalRetryErrors := 0
+	recoveries := 0
+	cacheHits := 0
+	cacheMisses := 0
+	lookupFailures := 0
+	changeDetectionEvents := 0
+	
+	currentMarker := lastMarker
+	
+	serviceStats.Lock()
+	serviceStats.TotalAPIRequests++
+	serviceStats.Unlock()
+	
+	// Fetch events from Bitwarden API
+	events, newMarker, err := fetchBitwardenEventsWithRetry(config, currentMarker, &totalRetryErrors, &recoveries)
+	if err != nil {
+		numErrors++
+		log.Printf("❌ Error fetching events: %v", err)
+		return err
+	}
+	
+	pollEnd = time.Now()
+	
+	if len(events) > 0 {
+		// Apply filtering
+		filteredEvents, droppedCount := filterEvents(events, fieldMapping.EventFiltering)
+		totalEventsFiltered += droppedCount
+		
+		if len(filteredEvents) > 0 {
+			// Forward events with enrichment
+			forwarded, dropped, cacheStats, lookupStats, changeStats, err := forwardEventsWithStats(
+				filteredEvents, config, fieldMapping, syslogWriter)
+			
+			if err != nil {
+				numErrors++
+				log.Printf("❌ Error forwarding events: %v", err)
+				return err
+			}
+			
+			totalEventsProcessed += forwarded
+			totalEventsDropped += dropped
+			cacheHits += cacheStats.Hits
+			cacheMisses += cacheStats.Misses
+			lookupFailures += lookupStats.Failures
+			changeDetectionEvents += changeStats.ChangeEvents
+		}
+	}
+	
+	// Update marker
+	if newMarker != "" && newMarker != currentMarker {
+		if err := saveMarkerToFile(config.MarkerFile, newMarker); err != nil {
+			numErrors++
+			log.Printf("❌ Error saving marker file: %v", err)
+		} else {
+			serviceStats.Lock()
+			serviceStats.MarkerFileUpdates++
+			serviceStats.LastMarker = newMarker
+			serviceStats.Unlock()
+		}
+	}
+	
+	// Calculate comprehensive statistics
+	periodStart := pollStart.Unix()
+	periodEnd := pollEnd.Unix()
+	
+	var eventsPerSecond float64
+	if pollEnd.After(pollStart) && totalEventsProcessed > 0 {
+		duration := pollEnd.Sub(pollStart).Seconds()
+		eventsPerSecond = float64(totalEventsProcessed) / duration
+		
+		serviceStats.Lock()
+		serviceStats.CurrentPollDuration = pollEnd.Sub(pollStart)
+		serviceStats.AverageEventsPerSecond = eventsPerSecond
+		serviceStats.LastSuccessfulRun = pollEnd
+		serviceStats.TotalEventsForwarded += int64(totalEventsProcessed)
+		serviceStats.TotalEventsFiltered += int64(totalEventsFiltered)
+		serviceStats.TotalEventsDropped += int64(totalEventsDropped)
+		serviceStats.CacheHits += int64(cacheHits)
+		serviceStats.CacheMisses += int64(cacheMisses)
+		serviceStats.LookupFailures += int64(lookupFailures)
+		serviceStats.ChangeDetectionEvents += int64(changeDetectionEvents)
+		serviceStats.TotalRetryAttempts += int64(totalRetryErrors)
+		serviceStats.SuccessfulRecoveries += int64(recoveries)
+		serviceStats.Unlock()
+	}
+	
+	// Enhanced logging output similar to main4.go
+	log.Printf("📊 Poll Summary [%d - %d]: Events fetched: %d, filtered: %d, forwarded: %d, dropped: %d, "+
+		"rate: %.2f events/sec, errors: %d, retries: %d, recoveries: %d, cache hits: %d, misses: %d, "+
+		"lookups failed: %d, changes detected: %d, marker updates: %d, total forwarded: %d",
+		periodStart, periodEnd, totalEventsProcessed+totalEventsFiltered, totalEventsFiltered,
+		totalEventsProcessed, totalEventsDropped, eventsPerSecond, numErrors, totalRetryErrors,
+		recoveries, cacheHits, cacheMisses, lookupFailures, changeDetectionEvents,
+		serviceStats.MarkerFileUpdates, serviceStats.TotalEventsForwarded)
+	
+	return nil
+}
+
+func fetchBitwardenEventsWithRetry(config Configuration, marker string, totalRetryErrors *int, recoveries *int) ([]BitwardenEvent, string, error) {
 	var lastErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if attempt > 1 {
-			backoff := time.Duration(attempt*2) * time.Second
-			log.Printf("⏳ Retrying authentication in %v...", backoff)
-			time.Sleep(backoff)
+	
+	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(config.RetryDelay) * time.Second
+			log.Printf("🔄 Retry attempt %d/%d after %v", attempt, config.MaxRetries, delay)
+			time.Sleep(delay)
 		}
-
-		log.Printf("🔄 Authentication attempt %d/%d", attempt, maxRetries)
-		token, err := fetchOAuth2Token(cfg)
+		
+		events, newMarker, err := fetchBitwardenEvents(config, marker)
 		if err == nil {
-			return token, nil
+			if attempt > 0 {
+				*recoveries++
+			}
+			return events, newMarker, nil
 		}
-
+		
+		*totalRetryErrors++
 		lastErr = err
-		log.Printf("⚠️  Authentication attempt %d failed: %v", attempt, err)
+		log.Printf("❌ API request attempt %d failed: %v", attempt+1, err)
 	}
-
-	return OAuth2Token{}, fmt.Errorf("authentication failed after %d attempts: %w", maxRetries, lastErr)
+	
+	return nil, "", fmt.Errorf("all retry attempts failed, last error: %w", lastErr)
 }
 
-// loadFieldMapping loads field mapping configuration
+func fetchBitwardenEvents(config Configuration, marker string) ([]BitwardenEvent, string, error) {
+	// Check if token needs refresh
+	if currentToken == nil || time.Now().After(currentToken.ExpiresAt.Add(-5*time.Minute)) {
+		if err := authenticateWithBitwarden(config); err != nil {
+			return nil, "", fmt.Errorf("token refresh failed: %w", err)
+		}
+	}
+	
+	url := config.APIBaseURL + "/public/events"
+	if marker != "" {
+		url += "?start=" + marker
+	}
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("error creating request: %w", err)
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+currentToken.AccessToken)
+	req.Header.Set("User-Agent", "Bitwarden-Event-Forwarder/2.0")
+	
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+	}
+	
+	var response struct {
+		Data   []BitwardenEvent `json:"data"`
+		Marker string           `json:"continuationToken"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, "", fmt.Errorf("error parsing JSON response: %w", err)
+	}
+	
+	return response.Data, response.Marker, nil
+}
+
+// Event filtering logic
+func filterEvents(events []BitwardenEvent, filter EventFilter) ([]BitwardenEvent, int) {
+	if filter.Mode == "all" {
+		return events, 0
+	}
+	
+	var filteredEvents []BitwardenEvent
+	droppedCount := 0
+	
+	for _, event := range events {
+		eventType := fmt.Sprintf("%d", event.Type)
+		
+		// Check if event should be processed
+		if shouldProcessEvent(event, eventType, filter) {
+			filteredEvents = append(filteredEvents, event)
+		} else {
+			droppedCount++
+			if filter.Statistics.EnableDetailedLogging {
+				log.Printf("🚫 Filtered event type %s", eventType)
+			}
+		}
+	}
+	
+	return filteredEvents, droppedCount
+}
+
+// Enhanced event processing decision logic
+func shouldProcessEvent(event BitwardenEvent, eventType string, filter EventFilter) bool {
+	// Priority events always pass
+	for _, priority := range filter.PriorityEvents {
+		if eventType == priority {
+			return true
+		}
+	}
+	
+	// Check user filtering
+	if !passesUserFilter(event, filter.UserFiltering) {
+		return false
+	}
+	
+	// Check rate limiting
+	if !passesRateLimit(eventType, filter.RateLimiting) {
+		return false
+	}
+	
+	// Apply include/exclude logic
+	switch filter.Mode {
+	case "include":
+		if len(filter.IncludedEvents) == 0 {
+			return true // Include all if no specific includes
+		}
+		for _, included := range filter.IncludedEvents {
+			if eventType == included {
+				return true
+			}
+		}
+		return false
+		
+	case "exclude":
+		for _, excluded := range filter.ExcludedEvents {
+			if eventType == excluded {
+				return false
+			}
+		}
+		return true
+		
+	default:
+		return true
+	}
+}
+
+// Rate limiting logic
+func passesRateLimit(eventType string, rateLimits map[string]RateLimit) bool {
+	limit, exists := rateLimits[eventType]
+	if !exists || !limit.Enabled {
+		return true
+	}
+	
+	rateLimitTracker.Lock()
+	defer rateLimitTracker.Unlock()
+	
+	now := time.Now()
+	hourAgo := now.Add(-time.Hour)
+	
+	// Clean old timestamps
+	var recentEvents []time.Time
+	if timestamps, exists := rateLimitTracker.EventCounts[eventType]; exists {
+		for _, timestamp := range timestamps {
+			if timestamp.After(hourAgo) {
+				recentEvents = append(recentEvents, timestamp)
+			}
+		}
+	}
+	
+	// Check if we're under the limit
+	if len(recentEvents) >= limit.MaxPerHour {
+		return false
+	}
+	
+	// Add current event timestamp
+	recentEvents = append(recentEvents, now)
+	rateLimitTracker.EventCounts[eventType] = recentEvents
+	
+	return true
+}
+
+// User filtering logic
+func passesUserFilter(event BitwardenEvent, userFilter UserFilter) bool {
+	// Service account filtering
+	if userFilter.ExcludeServiceAccounts && isServiceAccount(event) {
+		return false
+	}
+	
+	// Include only specific users
+	if len(userFilter.IncludeOnlyUsers) > 0 {
+		userID := getUserIDFromEvent(event)
+		for _, user := range userFilter.IncludeOnlyUsers {
+			if userID == user {
+				return true
+			}
+		}
+		return false
+	}
+	
+	// Exclude specific users
+	userID := getUserIDFromEvent(event)
+	for _, user := range userFilter.ExcludeUsers {
+		if userID == user {
+			return false
+		}
+	}
+	
+	return true
+}
+
+// Helper functions for event processing
+func getUserIDFromEvent(event BitwardenEvent) string {
+	if event.MemberID != nil {
+		return *event.MemberID
+	}
+	return ""
+}
+
+func isServiceAccount(event BitwardenEvent) bool {
+	// Logic to determine if this is a service account event
+	// This would depend on how Bitwarden identifies service accounts
+	return false
+}
+
+// Enhanced forwarding with statistics
+func forwardEventsWithStats(events []BitwardenEvent, config Configuration, 
+	fieldMapping FieldMapping, syslogWriter *SyslogWriter) (int, int, CacheStats, LookupStats, ChangeStats, error) {
+	
+	var forwarded, dropped int
+	var cacheStats CacheStats
+	var lookupStats LookupStats
+	var changeStats ChangeStats
+	
+	for _, event := range events {
+		// Enrich event with lookups
+		enrichedEvent, cacheHit, lookupSuccess := enrichEvent(event, fieldMapping, config)
+		
+		if cacheHit {
+			cacheStats.Hits++
+		} else {
+			cacheStats.Misses++
+		}
+		
+		if !lookupSuccess {
+			lookupStats.Failures++
+		} else {
+			lookupStats.Success++
+		}
+		
+		// Format as CEF
+		cefMessage := formatEventAsCEF(enrichedEvent, config, fieldMapping)
+		syslogMessage := formatSyslogMessage("bitwarden-forwarder", cefMessage)
+		
+		// Truncate if too large
+		if len(syslogMessage) > config.MaxMsgSize {
+			syslogMessage = syslogMessage[:config.MaxMsgSize]
+		}
+		
+		// Send to syslog
+		if err := syslogWriter.Write(syslogMessage); err != nil {
+			log.Printf("🔄 Syslog write failed, attempting reconnect: %v", err)
+			if reconnectErr := syslogWriter.Reconnect(); reconnectErr != nil {
+				return forwarded, dropped, cacheStats, lookupStats, changeStats, fmt.Errorf("reconnection failed: %w", reconnectErr)
+			}
+			
+			if err = syslogWriter.Write(syslogMessage); err != nil {
+				dropped++
+				continue
+			}
+		}
+		
+		forwarded++
+	}
+	
+	return forwarded, dropped, cacheStats, lookupStats, changeStats, nil
+}
+
+func enrichEvent(event BitwardenEvent, fieldMapping FieldMapping, config Configuration) (map[string]interface{}, bool, bool) {
+	enriched := map[string]interface{}{
+		"id":           event.ID,
+		"type":         event.Type,
+		"date":         event.Date.Format(time.RFC3339),
+		"ipAddress":    event.IPAddress,
+		"device":       event.Device,
+		"object":       event.Object,
+	}
+	
+	if event.MemberID != nil {
+		enriched["memberId"] = *event.MemberID
+	}
+	if event.ActingUserID != nil {
+		enriched["actingUserId"] = *event.ActingUserID
+	}
+	if event.GroupID != nil {
+		enriched["groupId"] = *event.GroupID
+	}
+	if event.CollectionID != nil {
+		enriched["collectionId"] = *event.CollectionID
+	}
+	if event.PolicyID != nil {
+		enriched["policyId"] = *event.PolicyID
+	}
+	
+	// Add event type name
+	if eventName, exists := eventTypeMap[fmt.Sprintf("%d", event.Type)]; exists {
+		enriched["eventTypeName"] = eventName
+	}
+	
+	// TODO: Implement actual lookup enrichment
+	// This would involve making API calls to enrich with member names, group names, etc.
+	
+	return enriched, true, true // Placeholder return values
+}
+
+func formatEventAsCEF(event map[string]interface{}, config Configuration, fieldMapping FieldMapping) string {
+	eventType := fmt.Sprintf("%v", event["type"])
+	eventName := "Unknown Event"
+	
+	if name, exists := eventTypeMap[eventType]; exists {
+		eventName = name
+	}
+	
+	severity := mapEventTypeToSeverity(eventType)
+	
+	vendor := fieldMapping.CEFVendor
+	if vendor == "" {
+		vendor = "Bitwarden"
+	}
+	product := fieldMapping.CEFProduct
+	if product == "" {
+		product = "Events"
+	}
+	version := fieldMapping.CEFVersion
+	if version == "" {
+		version = "1.0"
+	}
+	
+	header := fmt.Sprintf("CEF:0|%s|%s|%s|%s|%s|%d|",
+		vendor, product, version, eventType, eventName, severity)
+	
+	extensions := make(map[string]string)
+	
+	// Apply field mappings
+	for sourceKey, targetKey := range fieldMapping.FieldMappings {
+		if value, exists := event[sourceKey]; exists && value != nil {
+			extensions[targetKey] = sanitizeCEFValue(fmt.Sprintf("%v", value))
+		}
+	}
+	
+	// Add unmapped fields
+	for k, v := range event {
+		if !isMappedField(k, fieldMapping.FieldMappings) && v != nil {
+			extensions[k] = sanitizeCEFValue(fmt.Sprintf("%v", v))
+		}
+	}
+	
+	// Format extensions in order
+	var parts []string
+	
+	// Ordered fields first
+	for _, field := range fieldMapping.OrderedFields {
+		if value, exists := extensions[field]; exists {
+			parts = append(parts, fmt.Sprintf("%s=%s", field, value))
+			delete(extensions, field)
+		}
+	}
+	
+	// Remaining fields alphabetically
+	var remaining []string
+	for k := range extensions {
+		remaining = append(remaining, k)
+	}
+	sort.Strings(remaining)
+	
+	for _, field := range remaining {
+		parts = append(parts, fmt.Sprintf("%s=%s", field, extensions[field]))
+	}
+	
+	return header + strings.Join(parts, " ")
+}
+
+func mapEventTypeToSeverity(eventType string) int {
+	severityMap := map[string]int{
+		"1000": 6, // Login
+		"1001": 6, // Changed password
+		"1002": 6, // 2FA enabled
+		"1005": 8, // Failed login
+		"1006": 8, // Failed 2FA
+		"1500": 6, // Invited user
+		"1501": 6, // Confirmed user
+		"1502": 6, // Edited user
+		"1503": 7, // Removed user
+		"1700": 7, // Modified policy
+		"1600": 7, // Edited org settings
+	}
+	
+	if severity, exists := severityMap[eventType]; exists {
+		return severity
+	}
+	return 5 // Default severity
+}
+
+func sanitizeCEFValue(value string) string {
+	// Escape special CEF characters
+	value = strings.ReplaceAll(value, "\\", "\\\\")
+	value = strings.ReplaceAll(value, "=", "\\=")
+	value = strings.ReplaceAll(value, "|", "\\|")
+	value = strings.ReplaceAll(value, "\n", "\\n")
+	value = strings.ReplaceAll(value, "\r", "\\r")
+	return value
+}
+
+func formatSyslogMessage(hostname, message string) string {
+	priority := "134" // local0.info
+	timestamp := time.Now().Format("Jan _2 15:04:05") // Use underscore for proper single-digit day spacing
+	return fmt.Sprintf("<%s>%s %s %s", priority, timestamp, hostname, message)
+}
+
+func isMappedField(fieldName string, fieldMappings map[string]string) bool {
+	_, exists := fieldMappings[fieldName]
+	return exists
+}
+
 func loadFieldMapping(filename string) FieldMapping {
-	defaultMapping := FieldMapping{
+	defaultMapping := createDefaultFieldMapping()
+	
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("📋 Creating default field mapping file: %s", filename)
+			saveFieldMapping(filename, defaultMapping)
+		}
+		return defaultMapping
+	}
+	
+	var mapping FieldMapping
+	if err := json.Unmarshal(data, &mapping); err != nil {
+		log.Printf("❌ Error parsing field mapping file: %v, using defaults", err)
+		return defaultMapping
+	}
+	
+	return mapping
+}
+
+func loadEventTypeMap(filename string) map[string]string {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("❌ Event type mapping file not found: %s", filename)
+			log.Printf("📝 Please ensure bitwarden_event_map.json exists")
+			return make(map[string]string) // Return empty map if file doesn't exist
+		}
+		log.Printf("❌ Error reading event type mapping file: %v", err)
+		return make(map[string]string)
+	}
+	
+	var eventMap map[string]string
+	if err := json.Unmarshal(data, &eventMap); err != nil {
+		log.Printf("❌ Error parsing event type mapping file: %v", err)
+		return make(map[string]string)
+	}
+	
+	return eventMap
+}
+
+func createDefaultFieldMapping() FieldMapping {
+	return FieldMapping{
 		OrderedFields: []string{
 			"rt", "cs1", "cs2", "suser", "email", "status", "2fa", "host_ip",
 			"device", "groupId", "collectionId", "policyId", "actingUserId",
@@ -370,109 +1308,104 @@ func loadFieldMapping(filename string) FieldMapping {
 			"changeType", "changeCount", "changedFields", "oldValues", "newValues",
 		},
 		FieldMappings: map[string]string{
-			"date":              "rt",
-			"type":              "cs1",
-			"id":                "cs2",
-			"memberId":          "suser",
-			"actingUserId":      "actingUserId",
-			"email":             "email",
-			"status":            "status",
-			"twoFactorEnabled":  "2fa",
-			"ipAddress":         "host_ip",
-			"device":            "device",
-			"groupId":           "groupId",
-			"collectionId":      "collectionId",
-			"policyId":          "policyId",
-			"object":            "objectname",
+			"date":           "rt",
+			"type":           "cs1",
+			"id":             "cs2",
+			"memberId":       "suser",
+			"actingUserId":   "actingUserId",
+			"ipAddress":      "host_ip",
+			"device":         "device",
+			"groupId":        "groupId",
+			"collectionId":   "collectionId",
+			"policyId":       "policyId",
+			"object":         "objectname",
 		},
-		Lookups: map[string]LookupRule{
+		Lookups: map[string]LookupConfig{
 			"memberId": {
 				Endpoint: "/public/members/{id}",
 				ResponseMapping: map[string]string{
-					"name":             "memberName",
-					"email":            "memberEmail",
-					"status":           "memberStatus",
-					"twoFactorEnabled": "member2FA",
-				},
-			},
-			"groupId": {
-				Endpoint: "/public/groups/{id}",
-				ResponseMapping: map[string]string{
-					"name": "groupName",
-				},
-			},
-			"collectionId": {
-				Endpoint: "/public/collections/{id}",
-				ResponseMapping: map[string]string{
-					"name": "collectionName",
-				},
-			},
-			"policyId": {
-				Endpoint: "/public/policies/{type}",
-				ResponseMapping: map[string]string{
-					"type":           "policyType",
-					"enabled":        "policyEnabled",
-					"policyTypeName": "policyTypeName",
+					"name":                  "memberName",
+					"email":                 "memberEmail",
+					"status":                "memberStatus",
+					"twoFactorEnabled":      "member2FA",
+					"type":                  "memberType",
+					"accessAll":             "memberAccessAll",
+					"externalId":            "memberExternalId",
+					"resetPasswordEnrolled": "memberResetPasswordEnrolled",
 				},
 			},
 		},
-		CacheInvalidationRules: map[int][]string{
-			1700: {"policyId"},
-			1500: {"memberId"}, 1501: {"memberId"}, 1502: {"memberId"},
-			1503: {"memberId"}, 1515: {"memberId"}, 1516: {"memberId"},
-			1400: {"groupId"}, 1401: {"groupId"}, 1402: {"groupId"},
-			1300: {"collectionId"}, 1301: {"collectionId"}, 1302: {"collectionId"},
+		CacheInvalidationRules: map[string][]string{
+			"1700": {"policyId"},
+			"1500": {"memberId"}, "1501": {"memberId"}, "1502": {"memberId"},
+			"1503": {"memberId"}, "1504": {"memberId"}, "1505": {"memberId"},
+			"1400": {"groupId"}, "1401": {"groupId"}, "1402": {"groupId"},
+			"1300": {"collectionId"}, "1301": {"collectionId"}, "1302": {"collectionId"},
+		},
+		EventFiltering: EventFilter{
+			Mode: "exclude",
+			ExcludedEvents: []string{
+				"1114", "1107", "1108", "1109", "1110", "1111", "1112", "1113", "1117",
+			},
+			IncludedEvents: []string{},
+			RateLimiting: map[string]RateLimit{
+				"1114": {MaxPerHour: 10, Enabled: true},
+				"1107": {MaxPerHour: 50, Enabled: true},
+				"1111": {MaxPerHour: 20, Enabled: true},
+			},
+			PriorityEvents: []string{
+				"1000", "1001", "1002", "1005", "1006",
+				"1500", "1501", "1502", "1503",
+				"1700", "1600", "1601",
+			},
+			UserFiltering: UserFilter{
+				ExcludeServiceAccounts: true,
+				ExcludeUsers:          []string{},
+				IncludeOnlyUsers:      []string{},
+			},
+		},
+		Statistics: StatisticsConfig{
+			EnableDetailedLogging:   true,
+			LogIntervalEvents:       100,
+			TrackCacheMetrics:       true,
+			TrackPerformanceMetrics: true,
 		},
 		CEFVendor:  "Bitwarden",
 		CEFProduct: "Events",
 		CEFVersion: "1.0",
 	}
+}
 
-	data, err := ioutil.ReadFile(filename)
+// Remove the redundant createDefaultEventMap function since events are loaded from JSON file
+
+func saveFieldMapping(filename string, mapping FieldMapping) error {
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	
+	data, err := json.MarshalIndent(mapping, "", "  ")
 	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("Creating default field mapping file: %s", filename)
-			createDefaultConfigFile(filename, defaultMapping)
-		}
-		return defaultMapping
+		return err
 	}
-
-	var mapping FieldMapping
-	if err := json.Unmarshal(data, &mapping); err != nil {
-		log.Printf("Error parsing field mapping file: %v, using defaults", err)
-		return defaultMapping
-	}
-
-	return mapping
+	
+	return ioutil.WriteFile(filename, data, 0644)
 }
 
-// createDefaultConfigFile creates a default configuration file
-func createDefaultConfigFile(filename string, mapping FieldMapping) {
-	if jsonData, err := json.MarshalIndent(mapping, "", "  "); err == nil {
-		if err := os.MkdirAll(filepath.Dir(filename), 0755); err == nil {
-			ioutil.WriteFile(filename, jsonData, 0644)
-		}
+func saveEventMap(filename string, eventMap map[string]string) error {
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
 	}
-}
-
-// loadEventTypeNames loads event type name mappings
-func loadEventTypeNames(filename string) map[string]string {
-	data, err := ioutil.ReadFile(filename)
+	
+	data, err := json.MarshalIndent(eventMap, "", "  ")
 	if err != nil {
-		log.Printf("Failed to read event type map file: %v", err)
-		return make(map[string]string)
+		return err
 	}
-
-	var eventMap map[string]string
-	if err := json.Unmarshal(data, &eventMap); err != nil {
-		log.Printf("Failed to parse event type map JSON: %v", err)
-		return make(map[string]string)
-	}
-
-	return eventMap
+	
+	return ioutil.WriteFile(filename, data, 0644)
 }
 
-// loadMarkerFromFile loads the last processed event marker
 func loadMarkerFromFile(filename string) string {
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
@@ -481,1063 +1414,50 @@ func loadMarkerFromFile(filename string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// saveMarkerToFile saves the last processed event marker
-func saveMarkerToFile(filename, marker string) error {
+func saveMarkerToFile(filename string, marker string) error {
 	if marker == "" {
 		return nil
 	}
-
-	if err := os.MkdirAll(filepath.Dir(filename), 0755); err != nil {
-		return fmt.Errorf("create marker directory: %w", err)
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory for marker file: %w", err)
 	}
-
 	return ioutil.WriteFile(filename, []byte(marker), 0644)
 }
 
-// pollEventsWithErrorRecovery polls events with comprehensive error handling
-func pollEventsWithErrorRecovery(ctx context.Context, cfg Configuration, token *OAuth2Token, cache *LookupCache, fieldMapping FieldMapping, eventTypeNames map[string]string) {
-	marker := loadMarkerFromFile(cfg.MarkerFile)
-	var continuationToken string
-	skipUntilMarker := marker != ""
-	var lastProcessedID string
-	consecutiveErrors := 0
-	const maxConsecutiveErrors = 5
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("Context cancelled, stopping event polling")
-			return
-		default:
-		}
-
-		// Check token expiry
-		if time.Now().After(token.Expiry.Add(-time.Minute)) {
-			log.Printf("🔄 Refreshing OAuth2 token...")
-			newToken, err := fetchOAuth2TokenWithRetry(cfg, 3)
-			if err != nil {
-				log.Printf("❌ Token refresh failed: %v", err)
-				consecutiveErrors++
-				if consecutiveErrors >= maxConsecutiveErrors {
-					log.Fatalf("💀 Too many consecutive token failures (%d)", consecutiveErrors)
-				}
-				time.Sleep(time.Duration(cfg.FetchInterval) * time.Second)
-				continue
-			}
-			*token = newToken
-			log.Printf("✅ Token refreshed successfully")
-			consecutiveErrors = 0
-		}
-
-		// Fetch events
-		eventsResp, err := fetchEvents(cfg, token, continuationToken)
-		if err != nil {
-			log.Printf("❌ Event fetch failed: %v", err)
-			consecutiveErrors++
-
-			if consecutiveErrors >= maxConsecutiveErrors {
-				log.Fatalf("💀 Too many consecutive API failures (%d)", consecutiveErrors)
-			}
-
-			backoff := time.Duration(consecutiveErrors*10) * time.Second
-			log.Printf("⏳ Backing off for %v...", backoff)
-			time.Sleep(backoff)
-			continue
-		}
-
-		if consecutiveErrors > 0 {
-			log.Printf("✅ Recovered from errors")
-			consecutiveErrors = 0
-		}
-
-		// Process events
-		eventsProcessed := 0
-		for i := range eventsResp.Data {
-			event := &eventsResp.Data[i]
-
-			if skipUntilMarker {
-				if event.ID == marker {
-					skipUntilMarker = false
-					log.Printf("📍 Reached marker %s, resuming", marker)
-				}
-				continue
-			}
-
-			// Enrich and send event
-			if err := processEvent(cfg, token, cache, fieldMapping, eventTypeNames, event); err != nil {
-				log.Printf("⚠️  Failed to process event %s: %v", event.ID, err)
-				continue
-			}
-
-			lastProcessedID = event.ID
-			eventsProcessed++
-		}
-
-		// Save progress
-		if lastProcessedID != "" {
-			if err := saveMarkerToFile(cfg.MarkerFile, lastProcessedID); err != nil {
-				log.Printf("⚠️  Failed to save marker: %v", err)
-			}
-		}
-
-		if eventsProcessed > 0 {
-			log.Printf("✅ Processed %d events", eventsProcessed)
-		}
-
-		// Handle pagination
-		if eventsResp.ContinuationToken == "" {
-			continuationToken = ""
-			time.Sleep(time.Duration(cfg.FetchInterval) * time.Second)
-		} else {
-			continuationToken = eventsResp.ContinuationToken
-		}
+// Utility functions
+func getEnvOrDefault(key, defaultValue string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
 	}
+	return defaultValue
 }
 
-// fetchEvents retrieves events from the Bitwarden API
-func fetchEvents(cfg Configuration, token *OAuth2Token, continuationToken string) (EventsResponse, error) {
-	url := cfg.APIBaseURL + "/public/events"
-	if continuationToken != "" {
-		url += "?continuationToken=" + continuationToken
-	}
-
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return EventsResponse{}, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("User-Agent", UserAgent)
-
-	client := &http.Client{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return EventsResponse{}, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return EventsResponse{}, fmt.Errorf("API returned status %d: %s", resp.StatusCode, body)
-	}
-
-	var eventsResp EventsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&eventsResp); err != nil {
-		return EventsResponse{}, fmt.Errorf("decode response: %w", err)
-	}
-
-	return eventsResp, nil
-}
-
-// processEvent enriches and sends a single event
-func processEvent(cfg Configuration, token *OAuth2Token, cache *LookupCache, fieldMapping FieldMapping, eventTypeNames map[string]string, event *Event) error {
-	// Enrich event
-	enrichEventWithLookups(cfg, token, cache, fieldMapping, event)
-
-	// Format as CEF
-	cef := formatEventAsCEF(*event, fieldMapping, eventTypeNames)
-
-	// Send to syslog with retry
-	return sendToSyslogWithRetry(cfg, cef, 3)
-}
-
-// enrichEventWithLookups enriches an event with API lookup data
-func enrichEventWithLookups(cfg Configuration, token *OAuth2Token, cache *LookupCache, mapping FieldMapping, event *Event) {
-	eventData := map[string]interface{}{
-		"id":            event.ID,
-		"memberId":      event.MemberID,
-		"actingUserId":  event.ActingUserID,
-		"type":          event.Type,
-		"date":          event.Date,
-		"itemId":        event.ItemID,
-		"collectionId":  event.CollectionID,
-		"groupId":       event.GroupID,
-		"policyId":      event.PolicyID,
-		"device":        event.Device,
-		"ipAddress":     event.IPAddress,
-	}
-
-	if event.Details == nil {
-		event.Details = make(map[string]interface{})
-	}
-
-	// Copy event data to details
-	for key, value := range eventData {
-		if value != nil && value != "" && value != 0 {
-			event.Details[key] = value
+func getEnvOrIntDefault(key string, defaultValue int) int {
+	if value, exists := os.LookupEnv(key); exists {
+		var result int
+		if _, err := fmt.Sscanf(value, "%d", &result); err == nil {
+			return result
 		}
 	}
-
-	// Smart cache invalidation
-	invalidateCacheForEvent(cache, mapping, event)
-
-	// Perform lookups
-	for fieldName, rule := range mapping.Lookups {
-		fieldValue, ok := eventData[fieldName].(string)
-		if !ok || fieldValue == "" {
-			continue
-		}
-
-		// Check for change data
-		changeData := checkForChangeData(cache, fieldName, fieldValue)
-
-		// Perform lookup
-		lookupData := performLookup(cfg, token, cache, fieldName, fieldValue, rule)
-		if lookupData == nil {
-			continue
-		}
-
-		// Apply response mappings
-		for srcField, dstField := range rule.ResponseMapping {
-			if value, exists := lookupData[srcField]; exists {
-				event.Details[dstField] = value
-			}
-		}
-
-		// Add change fields if available
-		if changeData != nil {
-			addChangeFields(event, rule, changeData, lookupData, fieldName)
-		}
-	}
+	return defaultValue
 }
 
-// The rest of the functions follow similar idiomatic patterns...
-// [Additional functions would continue here with proper Go idioms]
-
-// showHelpMessage displays usage information
-func showHelpMessage() {
-	fmt.Print(`Bitwarden Event Forwarder v` + Version + `
-
-USAGE:
-  bw-events [options]
-
-FLAGS:
-  --help                 Show this help message
-  --version              Show version information  
-  --validate             Validate configuration and exit
-  --test                 Test connections and exit
-  --config FILE          Load configuration from JSON file
-
-REQUIRED:
-  --client-id ID         Bitwarden API Client ID
-  --client-secret SECRET Bitwarden API Client Secret
-
-OPTIONS:
-  --api-url URL          API base URL (default: https://api.bitwarden.com)
-  --identity-url URL     Identity URL (default: https://identity.bitwarden.com)
-  --syslog-server HOST   Syslog server (default: localhost)
-  --syslog-port PORT     Syslog port (default: 514)
-  --syslog-proto PROTO   Protocol: tcp/udp (default: tcp)
-  --interval SECONDS     Fetch interval (default: 60)
-  --conn-timeout SECONDS Connection timeout (default: 30)
-  --log-level LEVEL      Log level: debug/info/warn/error (default: info)
-  --log-file FILE        Log file path (default: stdout)
-
-EXAMPLES:
-  bw-events --client-id "id" --client-secret "secret" --syslog-server "10.1.1.100"
-  bw-events --test --config /etc/bitwarden/config.json
-  bw-events --validate --config /etc/bitwarden/config.json
-
-`)
-}
-
-// showVersionInfo displays version information
-func showVersionInfo() {
-	fmt.Printf(`Bitwarden Event Forwarder
-Version: %s
-Build Date: %s
-Features: CEF formatting, change detection, intelligent caching
-`, Version, BuildDate)
-}
-
-// invalidateCacheForEvent performs smart cache invalidation based on event types
-func invalidateCacheForEvent(cache *LookupCache, mapping FieldMapping, event *Event) {
-	cacheTypes, exists := mapping.CacheInvalidationRules[event.Type]
-	if !exists {
-		return
-	}
-
-	log.Printf("Event type %d detected, performing cache refresh with change detection", event.Type)
-
-	for _, cacheType := range cacheTypes {
-		switch cacheType {
-		case "policyId":
-			performPolicyChangeDetection(cache, event)
-		case "memberId":
-			performMemberChangeDetection(cache, event)
-		case "groupId":
-			performGroupChangeDetection(cache, event)
-		case "collectionId":
-			performCollectionChangeDetection(cache, event)
-		default:
-			log.Printf("Unknown cache type for change detection: %s", cacheType)
-		}
-	}
-}
-
-// performPolicyChangeDetection captures old policy data before cache invalidation
-func performPolicyChangeDetection(cache *LookupCache, event *Event) {
-	if event.PolicyID == "" {
-		return
-	}
-
-	// Capture current cached state
-	oldData, hasOldData := cache.Get("policyDetails", event.PolicyID)
-
-	// Invalidate cache entries
-	cache.mu.Lock()
-	if cache.cache["policyDetails"] != nil {
-		delete(cache.cache["policyDetails"], event.PolicyID)
-	}
-	if cache.cache["policyIdToType"] != nil {
-		delete(cache.cache["policyIdToType"], "mapping")
-	}
-	cache.mu.Unlock()
-
-	log.Printf("Policy cache invalidated for ID: %s, had cached data: %v", event.PolicyID, hasOldData)
-
-	// Store change data for enrichment
-	if hasOldData {
-		changeData := map[string]interface{}{
-			"hasChanges": true,
-			"oldData":    oldData,
-		}
-		cache.Set("policyChanges", event.PolicyID, changeData)
-		log.Printf("Stored old policy data for change detection: %s", event.PolicyID)
-	}
-}
-
-// performMemberChangeDetection captures old member data before cache invalidation
-func performMemberChangeDetection(cache *LookupCache, event *Event) {
-	if event.MemberID == "" {
-		return
-	}
-
-	oldData, hasOldData := cache.Get("memberId", event.MemberID)
-
-	cache.mu.Lock()
-	if cache.cache["memberId"] != nil {
-		delete(cache.cache["memberId"], event.MemberID)
-	}
-	cache.mu.Unlock()
-
-	if hasOldData {
-		changeData := map[string]interface{}{
-			"hasChanges": true,
-			"oldData":    oldData,
-		}
-		cache.Set("memberChanges", event.MemberID, changeData)
-		log.Printf("Stored old member data for change detection: %s", event.MemberID)
-	}
-}
-
-// performGroupChangeDetection captures old group data before cache invalidation
-func performGroupChangeDetection(cache *LookupCache, event *Event) {
-	if event.GroupID == "" {
-		return
-	}
-
-	oldData, hasOldData := cache.Get("groupId", event.GroupID)
-
-	cache.mu.Lock()
-	if cache.cache["groupId"] != nil {
-		delete(cache.cache["groupId"], event.GroupID)
-	}
-	cache.mu.Unlock()
-
-	if hasOldData {
-		changeData := map[string]interface{}{
-			"hasChanges": true,
-			"oldData":    oldData,
-		}
-		cache.Set("groupChanges", event.GroupID, changeData)
-		log.Printf("Stored old group data for change detection: %s", event.GroupID)
-	}
-}
-
-// performCollectionChangeDetection captures old collection data before cache invalidation
-func performCollectionChangeDetection(cache *LookupCache, event *Event) {
-	if event.CollectionID == "" {
-		return
-	}
-
-	oldData, hasOldData := cache.Get("collectionId", event.CollectionID)
-
-	cache.mu.Lock()
-	if cache.cache["collectionId"] != nil {
-		delete(cache.cache["collectionId"], event.CollectionID)
-	}
-	cache.mu.Unlock()
-
-	if hasOldData {
-		changeData := map[string]interface{}{
-			"hasChanges": true,
-			"oldData":    oldData,
-		}
-		cache.Set("collectionChanges", event.CollectionID, changeData)
-		log.Printf("Stored old collection data for change detection: %s", event.CollectionID)
-	}
-}
-
-// checkForChangeData retrieves and cleans up change detection data
-func checkForChangeData(cache *LookupCache, fieldName, fieldValue string) map[string]interface{} {
-	changesCacheKey := fieldName + "Changes"
-	changeData, ok := cache.Get(changesCacheKey, fieldValue)
-	if !ok {
-		return nil
-	}
-
-	// Clean up the change data after using it
-	cache.mu.Lock()
-	if cache.cache[changesCacheKey] != nil {
-		delete(cache.cache[changesCacheKey], fieldValue)
-	}
-	cache.mu.Unlock()
-
-	return changeData
-}
-
-// performLookup executes API lookups with caching
-func performLookup(cfg Configuration, token *OAuth2Token, cache *LookupCache, cacheKey, id string, rule LookupRule) map[string]interface{} {
-	// Check cache first
-	if data, ok := cache.Get(cacheKey, id); ok {
-		return data
-	}
-
-	// Special handling for policies
-	if cacheKey == "policyId" {
-		return performPolicyLookup(cfg, token, cache, id)
-	}
-
-	// Standard API lookup
-	endpoint := strings.Replace(rule.Endpoint, "{id}", id, 1)
-	url := cfg.APIBaseURL + endpoint
-
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		log.Printf("Failed to create lookup request for %s: %v", cacheKey, err)
-		return nil
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("User-Agent", UserAgent)
-
-	client := &http.Client{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Lookup request failed for %s: %v", cacheKey, err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		log.Printf("Lookup failed for %s (%s): %d %s", cacheKey, id, resp.StatusCode, body)
-		return nil
-	}
-
-	var lookupResp map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&lookupResp); err != nil {
-		log.Printf("Failed to decode lookup response for %s: %v", cacheKey, err)
-		return nil
-	}
-
-	// Cache the result
-	cache.Set(cacheKey, id, lookupResp)
-	return lookupResp
-}
-
-// performPolicyLookup handles the special case of policy lookups
-func performPolicyLookup(cfg Configuration, token *OAuth2Token, cache *LookupCache, policyID string) map[string]interface{} {
-	// Check if we have the specific policy cached
-	if policy, ok := cache.Get("policyDetails", policyID); ok {
-		return policy
-	}
-
-	// Get ID->Type mapping
-	idToTypeMap := getPolicyIDToTypeMapping(cfg, token, cache)
-	if idToTypeMap == nil {
-		return nil
-	}
-
-	// Get policy type for this ID
-	policyType, exists := idToTypeMap[policyID]
-	if !exists {
-		log.Printf("Policy ID %s not found in policy list", policyID)
-		return nil
-	}
-
-	// Fetch detailed policy information
-	url := fmt.Sprintf("%s/public/policies/%d", cfg.APIBaseURL, policyType)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		log.Printf("Failed to create policy detail request: %v", err)
-		return nil
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("User-Agent", UserAgent)
-
-	client := &http.Client{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Policy detail request failed: %v", err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		log.Printf("Policy detail request failed: %d %s", resp.StatusCode, body)
-		return nil
-	}
-
-	var policyDetail map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&policyDetail); err != nil {
-		log.Printf("Failed to decode policy detail response: %v", err)
-		return nil
-	}
-
-	// Add human-readable policy type name
-	if policyTypeFloat, ok := policyDetail["type"].(float64); ok {
-		policyDetail["policyTypeName"] = getPolicyTypeName(int(policyTypeFloat))
-	}
-
-	// Cache the detailed policy information
-	cache.Set("policyDetails", policyID, policyDetail)
-	return policyDetail
-}
-
-// getPolicyIDToTypeMapping builds and caches the policy ID to Type mapping
-func getPolicyIDToTypeMapping(cfg Configuration, token *OAuth2Token, cache *LookupCache) map[string]int {
-	// Check if we have the mapping cached
-	if cachedMapping, ok := cache.Get("policyIdToType", "mapping"); ok {
-		if mapping, ok := cachedMapping.(map[string]int); ok {
-			return mapping
-		}
-	}
-
-	// Fetch all policies to build the mapping
-	idToTypeMap := make(map[string]int)
-
-	url := cfg.APIBaseURL + "/public/policies"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		log.Printf("Failed to create policies list request: %v", err)
-		return nil
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("User-Agent", UserAgent)
-
-	client := &http.Client{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Policies list request failed: %v", err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		log.Printf("Policies list request failed: %d %s", resp.StatusCode, body)
-		return nil
-	}
-
-	var policiesResp struct {
-		Object string                   `json:"object"`
-		Data   []map[string]interface{} `json:"data"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&policiesResp); err != nil {
-		log.Printf("Failed to decode policies list response: %v", err)
-		return nil
-	}
-
-	// Build ID->Type mapping
-	for _, policy := range policiesResp.Data {
-		if id, idOK := policy["id"].(string); idOK {
-			if policyType, typeOK := policy["type"].(float64); typeOK {
-				idToTypeMap[id] = int(policyType)
-			}
-		}
-	}
-
-	// Cache the mapping
-	cache.Set("policyIdToType", "mapping", idToTypeMap)
-	return idToTypeMap
-}
-
-// getPolicyTypeName returns human-readable policy type names
-func getPolicyTypeName(policyType int) string {
-	policyTypeNames := map[int]string{
-		0:  "TwoFactorAuthentication",
-		1:  "MasterPassword",
-		2:  "PasswordGenerator",
-		3:  "SingleOrg",
-		4:  "RequireSso",
-		5:  "PersonalOwnership",
-		6:  "DisableSend",
-		7:  "SendOptions",
-		8:  "ResetPassword",
-		9:  "MaximumVaultTimeout",
-		10: "DisablePersonalVaultExport",
-		11: "ActivateAutofill",
-	}
-
-	if name, exists := policyTypeNames[policyType]; exists {
-		return name
-	}
-	return fmt.Sprintf("UnknownPolicyType_%d", policyType)
-}
-
-// addChangeFields adds old/new value comparison fields to events
-func addChangeFields(event *Event, rule LookupRule, changeData, newData map[string]interface{}, fieldType string) {
-	oldDataInterface, ok := changeData["oldData"]
-	if !ok {
-		return
-	}
-
-	oldData, ok := oldDataInterface.(map[string]interface{})
-	if !ok {
-		return
-	}
-
-	var changedFields, oldValues, newValues, fieldNames []string
-
-	// Compare each mapped field and collect changes
-	for srcField, dstField := range rule.ResponseMapping {
-		oldValue := getStringValue(oldData[srcField])
-		newValue := getStringValue(newData[srcField])
-
-		// Only process if values are different
-		if oldValue != newValue {
-			changedFields = append(changedFields, dstField)
-
-			// Format as "fieldName: value" for better readability
-			oldValueFormatted := fmt.Sprintf("%s: %s", srcField, oldValue)
-			newValueFormatted := fmt.Sprintf("%s: %s", srcField, newValue)
-
-			oldValues = append(oldValues, escapeCommaValue(oldValueFormatted))
-			newValues = append(newValues, escapeCommaValue(newValueFormatted))
-			fieldNames = append(fieldNames, srcField)
-
-			// Add individual field changes
-			event.Details[dstField+"_oldValue"] = oldValue
-			event.Details[dstField+"_newValue"] = newValue
-			event.Details[dstField+"_changed"] = "true"
-
-			log.Printf("Change detected in %s.%s: '%s' -> '%s'", fieldType, srcField, oldValue, newValue)
-		}
-	}
-
-	// Add consolidated change summary if there are changes
-	if len(changedFields) > 0 {
-		event.Details["hasDataChanges"] = "true"
-		event.Details["changeType"] = fieldType
-		event.Details["changedFields"] = strings.Join(changedFields, ",")
-		event.Details["oldValues"] = strings.Join(oldValues, ", ")
-		event.Details["newValues"] = strings.Join(newValues, ", ")
-		event.Details["changeCount"] = fmt.Sprintf("%d", len(changedFields))
-
-		log.Printf("Summary: %d fields changed in %s: %v", len(changedFields), fieldType, fieldNames)
-	}
-}
-
-// getStringValue safely converts interface{} to string
-func getStringValue(value interface{}) string {
-	if value == nil {
-		return ""
-	}
-	return fmt.Sprintf("%v", value)
-}
-
-// escapeCommaValue escapes values for comma-delimited lists
-func escapeCommaValue(value string) string {
-	if strings.ContainsAny(value, ",;|\"") {
-		escaped := strings.ReplaceAll(value, "\"", "\\\"")
-		return "\"" + escaped + "\""
-	}
-	return value
-}
-
-// formatEventAsCEF formats an event as CEF message
-func formatEventAsCEF(event Event, mapping FieldMapping, eventTypeNames map[string]string) string {
-	// Get friendly event name
-	eventName := "Unknown Event"
-	if friendlyName, ok := eventTypeNames[fmt.Sprintf("%d", event.Type)]; ok {
-		eventName = friendlyName
-	}
-
-	// CEF Header
-	header := fmt.Sprintf("CEF:0|%s|%s|%s|%d|%s|Medium|",
-		mapping.CEFVendor, mapping.CEFProduct, mapping.CEFVersion,
-		event.Type, eventName)
-
-	// CEF Extensions
-	extensions := make(map[string]string)
-
-	// Map event details to CEF fields
-	for srcField, dstField := range mapping.FieldMappings {
-		if value, ok := event.Details[srcField]; ok && value != nil {
-			extensions[dstField] = fmt.Sprintf("%v", value)
-		}
-	}
-
-	// Build ordered extension string
-	var parts []string
-
-	// Add ordered fields first
-	for _, field := range mapping.OrderedFields {
-		if value, ok := extensions[field]; ok {
-			parts = append(parts, fmt.Sprintf("%s=%s", field, escapeValue(value)))
-			delete(extensions, field)
-		}
-	}
-
-	// Add remaining fields in sorted order
-	var remainingKeys []string
-	for key := range extensions {
-		remainingKeys = append(remainingKeys, key)
-	}
-	sort.Strings(remainingKeys)
-
-	for _, key := range remainingKeys {
-		parts = append(parts, fmt.Sprintf("%s=%s", key, escapeValue(extensions[key])))
-	}
-
-	return header + strings.Join(parts, " ")
-}
-
-// escapeValue escapes CEF values
-func escapeValue(value string) string {
-	replacements := []struct{ old, new string }{
-		{"\\", "\\\\"},
-		{"=", "\\="},
-		{"|", "\\|"},
-		{"\n", "\\n"},
-		{"\r", "\\r"},
-	}
-
-	result := value
-	for _, r := range replacements {
-		result = strings.ReplaceAll(result, r.old, r.new)
-	}
-	return result
-}
-
-// sendToSyslogWithRetry sends a message to syslog with retry logic
-func sendToSyslogWithRetry(cfg Configuration, message string, maxRetries int) error {
-	var lastErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if err := sendToSyslog(cfg, message); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-
-		if attempt < maxRetries {
-			backoff := time.Duration(attempt) * time.Second
-			time.Sleep(backoff)
-		}
-	}
-
-	return fmt.Errorf("syslog send failed after %d attempts: %w", maxRetries, lastErr)
-}
-
-// sendToSyslog sends a message to the configured syslog server
-func sendToSyslog(cfg Configuration, message string) error {
-	address := fmt.Sprintf("%s:%s", cfg.SyslogServer, cfg.SyslogPort)
-	conn, err := net.DialTimeout(cfg.SyslogProtocol, address, time.Duration(cfg.ConnTimeout)*time.Second)
-	if err != nil {
-		return fmt.Errorf("syslog connection failed: %w", err)
-	}
-	defer conn.Close()
-
-	if len(message) > cfg.MaxMsgSize {
-		message = message[:cfg.MaxMsgSize]
-	}
-
-	_, err = fmt.Fprintln(conn, message)
-	return err
-}
-
-// loadConfigFromFile loads additional configuration from JSON file
-func loadConfigFromFile(cfg *Configuration, filename string) error {
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("read config file: %w", err)
-	}
-
-	var fileConfig map[string]interface{}
-	if err := json.Unmarshal(data, &fileConfig); err != nil {
-		return fmt.Errorf("parse config file: %w", err)
-	}
-
-	// Override configuration with file values
-	configMap := map[string]*string{
-		"api_base_url":     &cfg.APIBaseURL,
-		"identity_url":     &cfg.IdentityURL,
-		"client_id":        &cfg.ClientID,
-		"client_secret":    &cfg.ClientSecret,
-		"syslog_protocol":  &cfg.SyslogProtocol,
-		"syslog_server":    &cfg.SyslogServer,
-		"syslog_port":      &cfg.SyslogPort,
-		"log_level":        &cfg.LogLevel,
-		"log_file":         &cfg.LogFile,
-		"marker_file":      &cfg.MarkerFile,
-		"field_map_file":   &cfg.FieldMapFile,
-		"event_map_file":   &cfg.EventMapFile,
-	}
-
-	for key, ptr := range configMap {
-		if val, ok := fileConfig[key].(string); ok {
-			*ptr = val
-		}
-	}
-
-	// Handle numeric fields
-	if val, ok := fileConfig["fetch_interval"].(float64); ok {
-		cfg.FetchInterval = int(val)
-	}
-	if val, ok := fileConfig["max_msg_size"].(float64); ok {
-		cfg.MaxMsgSize = int(val)
-	}
-	if val, ok := fileConfig["max_pagination"].(float64); ok {
-		cfg.MaxPagination = int(val)
-	}
-	if val, ok := fileConfig["conn_timeout"].(float64); ok {
-		cfg.ConnTimeout = int(val)
-	}
-
-	return nil
-}
-
-// validateConfiguration validates the configuration
-func validateConfiguration(cfg Configuration) error {
-	var errors []string
-
-	// Required fields
-	if cfg.ClientID == "" {
-		errors = append(errors, "Client ID is required (--client-id or BW_CLIENT_ID)")
-	}
-	if cfg.ClientSecret == "" {
-		errors = append(errors, "Client Secret is required (--client-secret or BW_CLIENT_SECRET)")
-	}
-
-	// URL validation
-	if !isValidURL(cfg.APIBaseURL) {
-		errors = append(errors, fmt.Sprintf("Invalid API URL: %s", cfg.APIBaseURL))
-	}
-	if !isValidURL(cfg.IdentityURL) {
-		errors = append(errors, fmt.Sprintf("Invalid Identity URL: %s", cfg.IdentityURL))
-	}
-
-	// Syslog validation
-	if cfg.SyslogProtocol != "tcp" && cfg.SyslogProtocol != "udp" {
-		errors = append(errors, "Syslog protocol must be 'tcp' or 'udp'")
-	}
-	if cfg.SyslogServer == "" {
-		errors = append(errors, "Syslog server is required")
-	}
-	if !isValidPort(cfg.SyslogPort) {
-		errors = append(errors, fmt.Sprintf("Invalid syslog port: %s", cfg.SyslogPort))
-	}
-
-	// Numeric validation
-	validations := []struct {
-		value int
-		min   int
-		name  string
-	}{
-		{cfg.FetchInterval, 1, "Fetch interval"},
-		{cfg.ConnTimeout, 1, "Connection timeout"},
-		{cfg.MaxMsgSize, 512, "Maximum message size"},
-		{cfg.MaxPagination, 1, "Maximum pagination"},
-	}
-
-	for _, v := range validations {
-		if v.value < v.min {
-			errors = append(errors, fmt.Sprintf("%s must be at least %d", v.name, v.min))
-		}
-	}
-
-	// Log level validation
-	validLogLevels := []string{"debug", "info", "warn", "error"}
-	if !contains(validLogLevels, cfg.LogLevel) {
-		errors = append(errors, fmt.Sprintf("Invalid log level: %s (must be one of: %v)", cfg.LogLevel, validLogLevels))
-	}
-
-	// File accessibility checks
-	fileChecks := []struct {
-		path      string
-		name      string
-		mustExist bool
-	}{
-		{cfg.FieldMapFile, "field mapping", true},
-		{cfg.EventMapFile, "event type mapping", true},
-		{cfg.MarkerFile, "marker", false},
-	}
-
-	for _, check := range fileChecks {
-		if err := checkFileAccessibility(check.path, check.name, check.mustExist); err != nil {
-			errors = append(errors, err.Error())
-		}
-	}
-
-	if cfg.LogFile != "" {
-		if err := checkFileAccessibility(cfg.LogFile, "log", false); err != nil {
-			errors = append(errors, err.Error())
-		}
-	}
-
-	if len(errors) > 0 {
-		return fmt.Errorf("configuration validation failed:\n  - %s", strings.Join(errors, "\n  - "))
-	}
-
-	return nil
-}
-
-// Helper validation functions
-func isValidURL(u string) bool {
-	return u != "" && (strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://"))
-}
-
-func isValidPort(port string) bool {
-	if port == "" {
-		return false
-	}
-	var p int
-	n, err := fmt.Sscanf(port, "%d", &p)
-	return err == nil && n == 1 && p > 0 && p <= 65535
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
+func getEnvOrBoolDefault(key string, defaultValue bool) bool {
+	if value, exists := os.LookupEnv(key); exists {
+		switch strings.ToLower(value) {
+		case "true", "1", "yes", "y", "on":
 			return true
+		case "false", "0", "no", "n", "off":
+			return false
 		}
 	}
-	return false
+	return defaultValue
 }
 
-func checkFileAccessibility(filename, fileType string, mustExist bool) error {
-	if filename == "" {
-		return fmt.Errorf("%s file path is empty", fileType)
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-
-	// Check if directory exists and is writable
-	dir := filepath.Dir(filename)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("cannot create directory for %s file: %w", fileType, err)
-	}
-
-	// Check if file exists when required
-	if mustExist {
-		if _, err := os.Stat(filename); os.IsNotExist(err) {
-			return fmt.Errorf("%s file does not exist: %s", fileType, filename)
-		}
-	}
-
-	return nil
-}
-
-// testConnections tests all required connections
-func testConnections(cfg Configuration) error {
-	fmt.Println("🔍 Testing configuration and connections...")
-
-	// Test Bitwarden API authentication
-	fmt.Print("  Testing Bitwarden API authentication... ")
-	token, err := fetchOAuth2Token(cfg)
-	if err != nil {
-		fmt.Println("❌ FAILED")
-		return fmt.Errorf("Bitwarden API authentication failed: %w", err)
-	}
-	fmt.Printf("✅ SUCCESS (expires: %s)\n", token.Expiry.Format("2006-01-02 15:04:05"))
-
-	// Test Bitwarden API connectivity
-	fmt.Print("  Testing Bitwarden API connectivity... ")
-	if err := testBitwardenAPI(cfg, &token); err != nil {
-		fmt.Println("❌ FAILED")
-		return fmt.Errorf("Bitwarden API connectivity failed: %w", err)
-	}
-	fmt.Println("✅ SUCCESS")
-
-	// Test Syslog connectivity
-	fmt.Print("  Testing Syslog connectivity... ")
-	if err := testSyslogConnection(cfg); err != nil {
-		fmt.Println("❌ FAILED")
-		return fmt.Errorf("Syslog connectivity failed: %w", err)
-	}
-	fmt.Println("✅ SUCCESS")
-
-	// Test configuration files
-	fmt.Print("  Testing configuration files... ")
-	if err := testConfigurationFiles(cfg); err != nil {
-		fmt.Println("❌ FAILED")
-		return fmt.Errorf("Configuration files test failed: %w", err)
-	}
-	fmt.Println("✅ SUCCESS")
-
-	return nil
-}
-
-// testBitwardenAPI tests API connectivity
-func testBitwardenAPI(cfg Configuration, token *OAuth2Token) error {
-	url := cfg.APIBaseURL + "/public/events?start=2025-01-01T00:00:00.000Z&end=2025-01-01T00:01:00.000Z"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("User-Agent", UserAgent)
-
-	client := &http.Client{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, body)
-	}
-
-	return nil
-}
-
-// testSyslogConnection tests syslog connectivity
-func testSyslogConnection(cfg Configuration) error {
-	address := fmt.Sprintf("%s:%s", cfg.SyslogServer, cfg.SyslogPort)
-	conn, err := net.DialTimeout(cfg.SyslogProtocol, address, time.Duration(cfg.ConnTimeout)*time.Second)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	// Send test message
-	testMessage := fmt.Sprintf("CEF:0|BitwardenEventForwarder|Test|1.0|0|Connection Test|Low|rt=%s",
-		time.Now().Format("2006-01-02T15:04:05.000Z"))
-	_, err = fmt.Fprintln(conn, testMessage)
-	return err
-}
-
-// testConfigurationFiles tests configuration file validity
-func testConfigurationFiles(cfg Configuration) error {
-	// Test field mapping file
-	fieldMapping := loadFieldMapping(cfg.FieldMapFile)
-	if len(fieldMapping.FieldMappings) == 0 {
-		return fmt.Errorf("field mapping file appears to be empty or invalid")
-	}
-
-	// Test event mapping file
-	eventMapping := loadEventTypeNames(cfg.EventMapFile)
-	if len(eventMapping) == 0 {
-		return fmt.Errorf("event mapping file appears to be empty or invalid")
-	}
-
-	return nil
+	return b
 }
