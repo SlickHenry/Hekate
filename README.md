@@ -1,4 +1,4 @@
-# Hekate - Enhanced API to Syslog Forwarder
+# Hekate - Enhanced Bitwarden API to Syslog Forwarder
 
 A standalone Go application that polls the Bitwarden Organization API for events and forwards them to a syslog server in CEF (Common Event Format) with **intelligent filtering**, **comprehensive statistics**, **change detection**, and **enhanced audit trails** for SIEM ingestion and security monitoring.
 
@@ -32,7 +32,7 @@ This application provides real-time event forwarding from Bitwarden Organization
 ### Building
 
 ```bash
-go build -o bw-events main.go
+go build -o bw-events bw-events.go
 ```
 
 ### Quick Start
