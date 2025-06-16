@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/ring"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -42,11 +43,16 @@ type Configuration struct {
 	Verbose            bool
 	MaxRetries         int
 	RetryDelay         int
-	MaxBackoffDelay    int
 	HealthCheckPort    int
 	TestMode           bool
 	ValidateMode       bool
 	ShowVersion        bool
+	EventCacheSize       int
+	EventCacheWindow     int
+	EnableEventCache     bool
+	InitialLookbackHours int
+	PollOverlapMinutes   int
+	MaxEventsPerPoll     int
 }
 
 type FieldMapping struct {
@@ -143,7 +149,6 @@ type BitwardenEvent struct {
 	Date         time.Time `json:"date"`
 	Device       int       `json:"device"`
 	IPAddress    *string   `json:"ipAddress"`
-	ID           string    `json:"id"`
 }
 
 type BitwardenEventsResponse struct {
@@ -181,6 +186,27 @@ type ChangeStats struct {
 	ChangeEvents int
 }
 
+type EventCache struct {
+	sync.RWMutex
+	processedEvents map[string]time.Time
+	eventRing       *ring.Ring
+	maxCacheSize    int
+	cacheWindow     time.Duration
+}
+
+type EventCacheStats struct {
+	DuplicatesDetected int64
+	CacheHits          int64
+	CacheMisses        int64
+	CacheSize          int
+}
+
+type TimeBasedMarker struct {
+	LastEventTime time.Time `json:"last_event_time"`
+	LastEventID   string    `json:"last_event_id"`
+	PollCount     int64     `json:"poll_count"`
+}
+
 var (
 	serviceStats     = &ServiceStats{StartTime: time.Now()}
 	rateLimitTracker = &RateLimitTracker{EventCounts: make(map[string][]time.Time)}
@@ -189,6 +215,9 @@ var (
 	cancel           context.CancelFunc
 	currentToken     *OAuthToken
 	eventTypeMap     map[string]string
+	eventCache       *EventCache
+	eventCacheStats  = &EventCacheStats{}
+	timeBasedMarker  = &TimeBasedMarker{}
 )
 
 func main() {
@@ -229,6 +258,18 @@ func main() {
 	}
 
 	fieldMapping := loadFieldMapping(config.FieldMapFile)
+	// Initialize event cache
+	if config.EnableEventCache {
+		cacheWindow := time.Duration(config.EventCacheWindow) * time.Second
+		eventCache = NewEventCache(config.EventCacheSize, cacheWindow)
+		log.Printf("🧠 Event deduplication cache initialized (size: %d, window: %v)", 
+			config.EventCacheSize, cacheWindow)
+		
+		// Start cleanup goroutine
+		go eventCache.cleanupExpired()
+	} else {
+		log.Println("⚠️  Event deduplication cache disabled")
+	}
 	eventTypeMap = loadEventTypeMap(config.EventMapFile)
 
 	syslogWriter, err := NewSyslogWriter(config.SyslogProtocol,
@@ -250,11 +291,13 @@ func main() {
 	log.Printf("🗺️  Field mappings loaded (%d lookups)", len(fieldMapping.Lookups))
 	log.Printf("📝 Event types loaded (%d types)", len(eventTypeMap))
 
-	lastMarker := loadMarkerFromFile(config.MarkerFile)
-	if lastMarker != "" {
-		log.Printf("📍 Resuming from marker: %s", lastMarker[:min(len(lastMarker), 20)]+"...")
+	timeBasedMarker := loadTimeBasedMarker(config.MarkerFile)
+	if timeBasedMarker.LastEventID != "" {
+		log.Printf("📍 Resuming from marker: %s (Poll #%d)", 
+			timeBasedMarker.LastEventTime.Format("2006-01-02 15:04:05"), timeBasedMarker.PollCount)
 	} else {
-		log.Println("🆕 Starting fresh - will collect from oldest available events")
+		log.Printf("🆕 Starting fresh - will collect from %s", 
+			timeBasedMarker.LastEventTime.Format("2006-01-02 15:04:05"))
 	}
 
 	if config.HealthCheckPort > 0 {
@@ -270,11 +313,8 @@ func main() {
 	ticker := time.NewTicker(time.Duration(config.FetchInterval) * time.Second)
 	defer ticker.Stop()
 
-	backoffDelay := 1 * time.Second
-	maxBackoff := time.Duration(config.MaxBackoffDelay) * time.Second
-
-	processEventsWithRecovery(config, fieldMapping, syslogWriter, lastMarker)
-
+	processEventsWithRecovery(config, fieldMapping, syslogWriter, timeBasedMarker)
+	
 	for {
 		select {
 		case <-ctx.Done():
@@ -282,19 +322,7 @@ func main() {
 			return
 
 		case <-ticker.C:
-			success := processEventsWithRecovery(config, fieldMapping, syslogWriter, lastMarker)
-
-			if success {
-				backoffDelay = 1 * time.Second
-				ticker.Reset(time.Duration(config.FetchInterval) * time.Second)
-			} else {
-				log.Printf("⏰ Processing failed, backing off for %v", backoffDelay)
-				ticker.Reset(backoffDelay)
-				backoffDelay *= 2
-				if backoffDelay > maxBackoff {
-					backoffDelay = maxBackoff
-				}
-			}
+			timeBasedMarker = processEventsWithRecovery(config, fieldMapping, syslogWriter, timeBasedMarker)
 
 		case sig := <-sigChan:
 			log.Printf("📨 Received signal %v, initiating graceful shutdown...", sig)
@@ -333,11 +361,16 @@ func loadConfig() Configuration {
 	verbose := flag.Bool("verbose", getEnvOrBoolDefault("VERBOSE", false), "Enable verbose output")
 	maxRetries := flag.Int("max-retries", getEnvOrIntDefault("MAX_RETRIES", 3), "Maximum retry attempts")
 	retryDelay := flag.Int("retry-delay", getEnvOrIntDefault("RETRY_DELAY", 5), "Retry delay in seconds")
-	maxBackoffDelay := flag.Int("max-backoff", getEnvOrIntDefault("MAX_BACKOFF_DELAY", 300), "Maximum backoff delay in seconds")
 	healthCheckPort := flag.Int("health-port", getEnvOrIntDefault("HEALTH_CHECK_PORT", 8080), "Health check port (0 to disable)")
 	testMode := flag.Bool("test", false, "Test connections and dependencies")
 	validateMode := flag.Bool("validate", false, "Validate configuration and exit")
 	showVersion := flag.Bool("version", false, "Show version information")
+	eventCacheSize := flag.Int("event-cache-size", getEnvOrIntDefault("EVENT_CACHE_SIZE", 10000), "Maximum number of event IDs to cache")
+	eventCacheWindow := flag.Int("event-cache-window", getEnvOrIntDefault("EVENT_CACHE_WINDOW", 3600), "Event cache window in seconds")
+	enableEventCache := flag.Bool("enable-event-cache", getEnvOrBoolDefault("ENABLE_EVENT_CACHE", true), "Enable event deduplication cache")
+	initialLookback := flag.Int("initial-lookback-hours", getEnvOrIntDefault("INITIAL_LOOKBACK_HOURS", 24), "Hours to look back for initial poll")
+	pollOverlap := flag.Int("poll-overlap-minutes", getEnvOrIntDefault("POLL_OVERLAP_MINUTES", 5), "Minutes to overlap between polls")
+	maxEvents := flag.Int("max-events-per-poll", getEnvOrIntDefault("MAX_EVENTS_PER_POLL", 1000), "Maximum events to fetch per poll")
 
 	flag.Parse()
 
@@ -360,11 +393,16 @@ func loadConfig() Configuration {
 		Verbose:         *verbose,
 		MaxRetries:      *maxRetries,
 		RetryDelay:      *retryDelay,
-		MaxBackoffDelay: *maxBackoffDelay,
 		HealthCheckPort: *healthCheckPort,
 		TestMode:        *testMode,
 		ValidateMode:    *validateMode,
 		ShowVersion:     *showVersion,
+		EventCacheSize:       *eventCacheSize,
+		EventCacheWindow:     *eventCacheWindow,
+		EnableEventCache:     *enableEventCache,
+		InitialLookbackHours: *initialLookback,
+		PollOverlapMinutes:   *pollOverlap,
+		MaxEventsPerPoll:     *maxEvents,
 	}
 }
 
@@ -638,29 +676,77 @@ func testFilePermissions(config Configuration) error {
 	return nil
 }
 
+func getEventDeduplicationKey(event BitwardenEvent) string {
+	// Create a composite key from event properties since Bitwarden events have no ID
+	var keyParts []string
+	
+	// Always include type, date (to the second), and device
+	keyParts = append(keyParts, fmt.Sprintf("t%d", event.Type))
+	keyParts = append(keyParts, fmt.Sprintf("d%d", event.Date.Unix()))
+	keyParts = append(keyParts, fmt.Sprintf("dev%d", event.Device))
+	
+	// Add optional fields if present
+	if event.ActingUserID != nil {
+		keyParts = append(keyParts, fmt.Sprintf("au%s", *event.ActingUserID))
+	}
+	if event.MemberID != nil {
+		keyParts = append(keyParts, fmt.Sprintf("m%s", *event.MemberID))
+	}
+	if event.ItemID != nil {
+		keyParts = append(keyParts, fmt.Sprintf("i%s", *event.ItemID))
+	}
+	if event.GroupID != nil {
+		keyParts = append(keyParts, fmt.Sprintf("g%s", *event.GroupID))
+	}
+	if event.CollectionID != nil {
+		keyParts = append(keyParts, fmt.Sprintf("c%s", *event.CollectionID))
+	}
+	if event.PolicyID != nil {
+		keyParts = append(keyParts, fmt.Sprintf("p%s", *event.PolicyID))
+	}
+	if event.IPAddress != nil {
+		keyParts = append(keyParts, fmt.Sprintf("ip%s", *event.IPAddress))
+	}
+	
+	return strings.Join(keyParts, "|")
+}
+
 func startHealthCheckServer(port int) {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		serviceStats.RLock()
+		
+		// Get cache stats if available
+		var cacheStats EventCacheStats
+		if eventCache != nil {
+			cacheStats = eventCache.GetStats()
+		}
+		
 		status := map[string]interface{}{
-			"status":                "healthy",
-			"uptime":                time.Since(serviceStats.StartTime).String(),
-			"last_successful_run":   serviceStats.LastSuccessfulRun.Format(time.RFC3339),
-			"total_events":          serviceStats.TotalEventsForwarded,
-			"total_filtered":        serviceStats.TotalEventsFiltered,
-			"total_dropped":         serviceStats.TotalEventsDropped,
-			"total_api_requests":    serviceStats.TotalAPIRequests,
-			"failed_api_requests":   serviceStats.FailedAPIRequests,
-			"retry_attempts":        serviceStats.TotalRetryAttempts,
-			"successful_recoveries": serviceStats.SuccessfulRecoveries,
-			"syslog_reconnects":     serviceStats.SyslogReconnects,
-			"cache_hits":            serviceStats.CacheHits,
-			"cache_misses":          serviceStats.CacheMisses,
-			"lookup_failures":       serviceStats.LookupFailures,
-			"change_detection_events": serviceStats.ChangeDetectionEvents,
-			"marker_file_updates":   serviceStats.MarkerFileUpdates,
-			"last_error":            serviceStats.LastError,
-			"last_error_time":       serviceStats.LastErrorTime.Format(time.RFC3339),
-			"average_events_per_second": serviceStats.AverageEventsPerSecond,
+			"status":                      "healthy",
+			"uptime":                      time.Since(serviceStats.StartTime).String(),
+			"last_successful_run":         serviceStats.LastSuccessfulRun.Format(time.RFC3339),
+			"total_events":                serviceStats.TotalEventsForwarded,
+			"total_filtered":              serviceStats.TotalEventsFiltered,
+			"total_dropped":               serviceStats.TotalEventsDropped,
+			"total_api_requests":          serviceStats.TotalAPIRequests,
+			"failed_api_requests":         serviceStats.FailedAPIRequests,
+			"retry_attempts":              serviceStats.TotalRetryAttempts,
+			"successful_recoveries":       serviceStats.SuccessfulRecoveries,
+			"syslog_reconnects":           serviceStats.SyslogReconnects,
+			"cache_hits":                  serviceStats.CacheHits,
+			"cache_misses":                serviceStats.CacheMisses,
+			"lookup_failures":             serviceStats.LookupFailures,
+			"change_detection_events":     serviceStats.ChangeDetectionEvents,
+			"marker_file_updates":         serviceStats.MarkerFileUpdates,
+			"last_error":                  serviceStats.LastError,
+			"last_error_time":             serviceStats.LastErrorTime.Format(time.RFC3339),
+			"average_events_per_second":   serviceStats.AverageEventsPerSecond,
+			"event_cache": map[string]interface{}{
+				"duplicates_detected": cacheStats.DuplicatesDetected,
+				"cache_hits":         cacheStats.CacheHits,
+				"cache_misses":       cacheStats.CacheMisses,
+				"cache_size":         cacheStats.CacheSize,
+			},
 		}
 		serviceStats.RUnlock()
 
@@ -693,7 +779,7 @@ func startHealthCheckServer(port int) {
 	}
 }
 
-func processEventsWithRecovery(config Configuration, fieldMapping FieldMapping, syslogWriter *SyslogWriter, lastMarker string) bool {
+func processEventsWithRecovery(config Configuration, fieldMapping FieldMapping, syslogWriter *SyslogWriter, marker TimeBasedMarker) TimeBasedMarker {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("🚨 PANIC recovered in processEvents: %v", r)
@@ -704,7 +790,7 @@ func processEventsWithRecovery(config Configuration, fieldMapping FieldMapping, 
 		}
 	}()
 
-	err := processAllEventsWithStats(config, fieldMapping, syslogWriter, lastMarker)
+	newMarker, err := processAllEventsWithStats(config, fieldMapping, syslogWriter, marker)
 	if err != nil {
 		log.Printf("❌ Error processing events: %v", err)
 		serviceStats.Lock()
@@ -712,19 +798,22 @@ func processEventsWithRecovery(config Configuration, fieldMapping FieldMapping, 
 		serviceStats.LastErrorTime = time.Now()
 		serviceStats.FailedAPIRequests++
 		serviceStats.Unlock()
-		return false
+		
+		// Return marker with updated poll count even on failure
+		newMarker = marker
+		newMarker.PollCount++
 	}
 
-	return true
+	return newMarker
 }
 
-func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, syslogWriter *SyslogWriter, lastMarker string) error {
+func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, syslogWriter *SyslogWriter, marker TimeBasedMarker) (TimeBasedMarker, error) {
 	pollStart := time.Now()
-	var pollEnd time.Time
 	
 	totalEventsProcessed := 0
 	totalEventsFiltered := 0
 	totalEventsDropped := 0
+	totalDuplicates := 0
 	numErrors := 0
 	totalRetryErrors := 0
 	recoveries := 0
@@ -733,58 +822,73 @@ func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, 
 	lookupFailures := 0
 	changeDetectionEvents := 0
 	
-	currentMarker := lastMarker
-	
 	serviceStats.Lock()
 	serviceStats.TotalAPIRequests++
 	serviceStats.Unlock()
 	
-	events, newMarker, err := fetchBitwardenEventsWithRetry(config, currentMarker, &totalRetryErrors, &recoveries)
+	events, newMarker, err := fetchBitwardenEventsWithRetry(config, marker, &totalRetryErrors, &recoveries)
 	if err != nil {
 		numErrors++
 		log.Printf("❌ Error fetching events: %v", err)
-		return err
+		return marker, err
 	}
 	
-	pollEnd = time.Now()
+	pollEnd := time.Now()
 	
 	if len(events) > 0 {
-		filteredEvents, droppedCount := filterEvents(events, fieldMapping.EventFiltering, fieldMapping.Statistics)
+		// Use enhanced filtering with deduplication
+		filteredEvents, droppedCount, duplicateCount, eventCacheHits, eventCacheMisses := filterEventsWithDeduplication(events, fieldMapping.EventFiltering, fieldMapping.Statistics)
 		totalEventsFiltered += droppedCount
+		totalDuplicates += duplicateCount
 		
 		if len(filteredEvents) > 0 {
-			forwarded, dropped, cacheStats, lookupStats, changeStats, err := forwardEventsWithStats(
+			forwarded, dropped, _, lookupStats, changeStats, err := forwardEventsWithStats(
 				filteredEvents, config, fieldMapping, syslogWriter)
 			
 			if err != nil {
 				numErrors++
 				log.Printf("❌ Error forwarding events: %v", err)
-				return err
+				return marker, err
 			}
 			
 			totalEventsProcessed += forwarded
 			totalEventsDropped += dropped
-			cacheHits += cacheStats.Hits
-			cacheMisses += cacheStats.Misses
 			lookupFailures += lookupStats.Failures
 			changeDetectionEvents += changeStats.ChangeEvents
 		}
+		
+		// Track event cache stats separately from lookup cache stats
+		cacheHits += eventCacheHits
+		cacheMisses += eventCacheMisses
 	}
 	
-	if newMarker != "" && newMarker != currentMarker {
-		if err := saveMarkerToFile(config.MarkerFile, newMarker); err != nil {
-			numErrors++
-			log.Printf("❌ Error saving marker file: %v", err)
+	// Save the new marker
+	if err := saveTimeBasedMarker(config.MarkerFile, newMarker); err != nil {
+		log.Printf("⚠️  Warning: Error saving marker file: %v", err)
+	} else {
+		serviceStats.Lock()
+		serviceStats.MarkerFileUpdates++
+		serviceStats.Unlock()
+	}
+	
+	var periodStart, periodEnd int64
+	if len(events) > 0 {
+		// Use the time range of the actual events fetched
+		firstEvent := events[0]
+		lastEvent := events[len(events)-1]
+		periodStart = firstEvent.Date.Unix()
+		periodEnd = lastEvent.Date.Unix()
+	} else {
+		// No events - use the API query window
+		var startTime time.Time
+		if marker.PollCount == 0 {
+			startTime = pollStart.Add(-time.Duration(config.InitialLookbackHours) * time.Hour)
 		} else {
-			serviceStats.Lock()
-			serviceStats.MarkerFileUpdates++
-			serviceStats.LastMarker = newMarker
-			serviceStats.Unlock()
+			startTime = marker.LastEventTime.Add(-1 * time.Minute)
 		}
+		periodStart = startTime.Unix()
+		periodEnd = pollEnd.Unix()
 	}
-	
-	periodStart := pollStart.Unix()
-	periodEnd := pollEnd.Unix()
 	
 	var eventsPerSecond float64
 	if pollEnd.After(pollStart) && totalEventsProcessed > 0 {
@@ -807,18 +911,18 @@ func processAllEventsWithStats(config Configuration, fieldMapping FieldMapping, 
 		serviceStats.Unlock()
 	}
 	
-	log.Printf("📊 Poll Summary [%d - %d]: Events fetched: %d, filtered: %d, forwarded: %d, dropped: %d, "+
-		"rate: %.2f events/sec, errors: %d, retries: %d, recoveries: %d, cache hits: %d, misses: %d, "+
-		"lookups failed: %d, changes detected: %d, marker updates: %d, total forwarded: %d",
-		periodStart, periodEnd, totalEventsProcessed+totalEventsFiltered, totalEventsFiltered,
+	log.Printf("📊 Time-Based Poll #%d Summary [%d - %d]: Events=%d, Duplicates=%d, Filtered=%d, Forwarded=%d, Dropped=%d, "+
+		"Rate=%.2f events/sec, Errors=%d, Retries=%d, Recoveries=%d, EventCache H/M=%d/%d, "+
+		"Next Poll From=%s",
+		newMarker.PollCount, periodStart, periodEnd,
+		len(events), totalDuplicates, totalEventsFiltered,
 		totalEventsProcessed, totalEventsDropped, eventsPerSecond, numErrors, totalRetryErrors,
-		recoveries, cacheHits, cacheMisses, lookupFailures, changeDetectionEvents,
-		serviceStats.MarkerFileUpdates, serviceStats.TotalEventsForwarded)
-	
-	return nil
+		recoveries, cacheHits, cacheMisses,
+		newMarker.LastEventTime.Add(-time.Duration(config.PollOverlapMinutes) * time.Minute).Format("2006-01-02T15:04:05"))	
+	return newMarker, nil
 }
 
-func fetchBitwardenEventsWithRetry(config Configuration, marker string, totalRetryErrors *int, recoveries *int) ([]BitwardenEvent, string, error) {
+func fetchBitwardenEventsWithRetry(config Configuration, marker TimeBasedMarker, totalRetryErrors *int, recoveries *int) ([]BitwardenEvent, TimeBasedMarker, error) {
 	var lastErr error
 	
 	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
@@ -841,24 +945,49 @@ func fetchBitwardenEventsWithRetry(config Configuration, marker string, totalRet
 		log.Printf("❌ API request attempt %d failed: %v", attempt+1, err)
 	}
 	
-	return nil, "", fmt.Errorf("all retry attempts failed, last error: %w", lastErr)
+	return nil, marker, fmt.Errorf("all retry attempts failed, last error: %w", lastErr)
 }
 
-func fetchBitwardenEvents(config Configuration, marker string) ([]BitwardenEvent, string, error) {
+func fetchBitwardenEvents(config Configuration, marker TimeBasedMarker) ([]BitwardenEvent, TimeBasedMarker, error) {
 	if currentToken == nil || time.Now().After(currentToken.ExpiresAt.Add(-5*time.Minute)) {
 		if err := authenticateWithBitwarden(config); err != nil {
-			return nil, "", fmt.Errorf("token refresh failed: %w", err)
+			return nil, marker, fmt.Errorf("token refresh failed: %w", err)
 		}
 	}
 	
-	url := config.APIBaseURL + "/public/events"
-	if marker != "" {
-		url += "?start=" + marker
+	// FIXED: Proper sliding window calculation
+	var startTime time.Time
+	endTime := time.Now()
+	
+	if marker.LastEventTime.IsZero() || marker.PollCount == 0 {
+		// First poll: Use initial lookback
+		startTime = endTime.Add(-time.Duration(config.InitialLookbackHours) * time.Hour)
+	} else {
+		// Subsequent polls: Use configured overlap minutes
+		overlapDuration := time.Duration(config.PollOverlapMinutes) * time.Minute
+		startTime = marker.LastEventTime.Add(-overlapDuration)
 	}
+	
+	// Build URL with time parameters (IGNORE continuationToken completely)
+	url := fmt.Sprintf("%s/public/events?start=%s&end=%s", 
+		config.APIBaseURL,
+		startTime.Format(time.RFC3339),
+		endTime.Format(time.RFC3339))
+	
+		if config.Verbose {
+			overlapStr := fmt.Sprintf("%dm", config.PollOverlapMinutes)
+			if marker.PollCount == 0 {
+				overlapStr = fmt.Sprintf("%dh", config.InitialLookbackHours)
+			}
+			log.Printf("🔍 Fetching events: Start=%s, End=%s (overlap=%s)", 
+				startTime.Format("2006-01-02T15:04:05"), 
+				endTime.Format("2006-01-02T15:04:05"),
+				overlapStr)
+		}
 	
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("error creating request: %w", err)
+		return nil, marker, fmt.Errorf("error creating request: %w", err)
 	}
 	
 	req.Header.Set("Authorization", "Bearer "+currentToken.AccessToken)
@@ -867,50 +996,43 @@ func fetchBitwardenEvents(config Configuration, marker string) ([]BitwardenEvent
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("HTTP request failed: %w", err)
+		return nil, marker, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		return nil, marker, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
 	
 	var response BitwardenEventsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, "", fmt.Errorf("error parsing JSON response: %w", err)
+		return nil, marker, fmt.Errorf("error parsing JSON response: %w", err)
 	}
 	
-	newMarker := ""
-	if response.ContinuationToken != nil {
-		newMarker = *response.ContinuationToken
+	if config.Verbose {
+		log.Printf("🔍 Raw API response: EventCount=%d (ignoring continuationToken)", len(response.Data))
+	}
+	
+	// Sort events by date to ensure proper ordering
+	sort.Slice(response.Data, func(i, j int) bool {
+		return response.Data[i].Date.Before(response.Data[j].Date)
+	})
+	
+	// FIXED: Update marker with the current poll's endTime (becomes next poll's reference point)
+	newMarker := TimeBasedMarker{
+		LastEventTime: endTime,  // CRITICAL: Always use endTime so next poll can calculate properly
+		LastEventID:   "",       // Optional: could store latest event ID for reference
+		PollCount:     marker.PollCount + 1,
+	}
+	
+	// Optional: Store a reference to the newest event for debugging
+	if len(response.Data) > 0 {
+		newestEvent := response.Data[len(response.Data)-1]
+		newMarker.LastEventID = getEventDeduplicationKey(newestEvent)
 	}
 	
 	return response.Data, newMarker, nil
-}
-
-func filterEvents(events []BitwardenEvent, filter EventFilter, stats StatisticsConfig) ([]BitwardenEvent, int) {
-	if filter.Mode == "all" {
-		return events, 0
-	}
-	
-	var filteredEvents []BitwardenEvent
-	droppedCount := 0
-	
-	for _, event := range events {
-		eventType := fmt.Sprintf("%d", event.Type)
-		
-		if shouldProcessEvent(event, eventType, filter) {
-			filteredEvents = append(filteredEvents, event)
-		} else {
-			droppedCount++
-			if stats.EnableDetailedLogging {
-				log.Printf("🚫 Filtered event type %s", eventType)
-			}
-		}
-	}
-	
-	return filteredEvents, droppedCount
 }
 
 func shouldProcessEvent(event BitwardenEvent, eventType string, filter EventFilter) bool {
@@ -1020,6 +1142,8 @@ func isServiceAccount(event BitwardenEvent) bool {
 	return false
 }
 
+// REPLACE your existing forwardEventsWithStats function with this version:
+
 func forwardEventsWithStats(events []BitwardenEvent, config Configuration, 
 	fieldMapping FieldMapping, syslogWriter *SyslogWriter) (int, int, CacheStats, LookupStats, ChangeStats, error) {
 	
@@ -1029,6 +1153,9 @@ func forwardEventsWithStats(events []BitwardenEvent, config Configuration,
 	var changeStats ChangeStats
 	
 	for _, event := range events {
+		// Declare eventKey at the beginning of the loop so it's available throughout
+		eventKey := getEventDeduplicationKey(event)
+		
 		enrichedEvent, cacheHit, lookupSuccess := enrichEvent(event, fieldMapping, config)
 		
 		if cacheHit {
@@ -1058,10 +1185,20 @@ func forwardEventsWithStats(events []BitwardenEvent, config Configuration,
 			
 			if err = syslogWriter.Write(syslogMessage); err != nil {
 				dropped++
+				log.Printf("❌ Failed to forward event Key=%s after reconnect: %v", eventKey, err)
 				continue
 			}
 		}
 		
+		// ONLY mark as processed AFTER successful forwarding
+		if eventCache != nil {
+			eventCache.MarkProcessed(eventKey)
+			log.Printf("✅ MARKED PROCESSED: Key=%s, Type=%s, EventTime=%s, ProcessedAt=%s", 
+				eventKey, fmt.Sprintf("%d", event.Type), 
+				event.Date.Format("2006-01-02T15:04:05"),
+				time.Now().Format("2006-01-02T15:04:05"))
+		}
+			
 		forwarded++
 	}
 	
@@ -1069,8 +1206,9 @@ func forwardEventsWithStats(events []BitwardenEvent, config Configuration,
 }
 
 func enrichEvent(event BitwardenEvent, fieldMapping FieldMapping, config Configuration) (map[string]interface{}, bool, bool) {
+	eventKey := getEventDeduplicationKey(event)
 	enriched := map[string]interface{}{
-		"id":     event.ID,
+		"eventKey": eventKey,
 		"type":   event.Type,
 		"date":   event.Date.Format(time.RFC3339),
 		"device": event.Device,
@@ -1325,25 +1463,6 @@ func saveFieldMapping(filename string, mapping FieldMapping) error {
 	return ioutil.WriteFile(filename, data, 0644)
 }
 
-func loadMarkerFromFile(filename string) string {
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-func saveMarkerToFile(filename string, marker string) error {
-	if marker == "" {
-		return nil
-	}
-	dir := filepath.Dir(filename)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory for marker file: %w", err)
-	}
-	return ioutil.WriteFile(filename, []byte(marker), 0644)
-}
-
 func getEnvOrDefault(key, defaultValue string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
@@ -1371,6 +1490,178 @@ func getEnvOrBoolDefault(key string, defaultValue bool) bool {
 		}
 	}
 	return defaultValue
+}
+
+// Event Cache Functions
+func NewEventCache(maxSize int, windowDuration time.Duration) *EventCache {
+	return &EventCache{
+		processedEvents: make(map[string]time.Time),
+		eventRing:       ring.New(maxSize),
+		maxCacheSize:    maxSize,
+		cacheWindow:     windowDuration,
+	}
+}
+
+func (ec *EventCache) HasProcessed(eventID string) bool {
+	ec.RLock()
+	defer ec.RUnlock()
+	_, exists := ec.processedEvents[eventID]
+	return exists
+}
+
+func (ec *EventCache) MarkProcessed(eventID string) {
+	ec.Lock()
+	defer ec.Unlock()
+	
+	now := time.Now()
+	if len(ec.processedEvents) >= ec.maxCacheSize {
+		if ec.eventRing.Value != nil {
+			if oldestID, ok := ec.eventRing.Value.(string); ok {
+				delete(ec.processedEvents, oldestID)
+			}
+		}
+	}
+	
+	ec.processedEvents[eventID] = now
+	ec.eventRing.Value = eventID
+	ec.eventRing = ec.eventRing.Next()
+}
+
+func (ec *EventCache) GetStats() EventCacheStats {
+	ec.RLock()
+	defer ec.RUnlock()
+	
+	return EventCacheStats{
+		DuplicatesDetected: eventCacheStats.DuplicatesDetected,
+		CacheHits:          eventCacheStats.CacheHits,
+		CacheMisses:        eventCacheStats.CacheMisses,
+		CacheSize:          len(ec.processedEvents),
+	}
+}
+
+func (ec *EventCache) cleanupExpired() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			ec.Lock()
+			now := time.Now()
+			cutoff := now.Add(-ec.cacheWindow)
+			
+			for eventID, timestamp := range ec.processedEvents {
+				if timestamp.Before(cutoff) {
+					delete(ec.processedEvents, eventID)
+				}
+			}
+			ec.Unlock()
+			
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// Time-based Marker Functions
+func loadTimeBasedMarker(filename string) TimeBasedMarker {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("⚠️  Error reading marker file %s: %v", filename, err)
+		}
+		return TimeBasedMarker{
+			LastEventTime: time.Now().Add(-24 * time.Hour),
+			LastEventID:   "",
+			PollCount:     0,
+		}
+	}
+	
+	var marker TimeBasedMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		log.Printf("⚠️  Error parsing marker file, using defaults: %v", err)
+		return TimeBasedMarker{
+			LastEventTime: time.Now().Add(-24 * time.Hour),
+			LastEventID:   "",
+			PollCount:     0,
+		}
+	}
+	
+	log.Printf("📍 Loaded time-based marker: LastEventTime=%s, PollCount=%d", 
+		marker.LastEventTime.Format(time.RFC3339), marker.PollCount)
+	
+	return marker
+}
+
+func saveTimeBasedMarker(filename string, marker TimeBasedMarker) error {
+	data, err := json.MarshalIndent(marker, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal marker: %w", err)
+	}
+	
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory for marker file: %w", err)
+	}
+	
+	return ioutil.WriteFile(filename, data, 0644)
+}
+
+// Enhanced Filtering with Deduplication
+func filterEventsWithDeduplication(events []BitwardenEvent, filter EventFilter, stats StatisticsConfig) ([]BitwardenEvent, int, int, int, int) {
+	if filter.Mode == "all" && eventCache == nil {
+		return events, 0, 0, 0, 0
+	}
+	
+	var filteredEvents []BitwardenEvent
+	droppedCount := 0
+	duplicateCount := 0
+	localCacheHits := 0
+	localCacheMisses := 0
+	
+	for _, event := range events {
+		eventType := fmt.Sprintf("%d", event.Type)
+		eventKey := getEventDeduplicationKey(event)
+		
+		if eventCache != nil {
+			if eventCache.HasProcessed(eventKey) {
+				// CACHE HIT - it's a duplicate
+				duplicateCount++
+				eventCacheStats.DuplicatesDetected++
+				eventCacheStats.CacheHits++
+				localCacheHits++
+				
+				eventCache.RLock()
+				processedTime, exists := eventCache.processedEvents[eventKey]
+				eventCache.RUnlock()
+				
+				if exists {
+					log.Printf("🔄 DUPLICATE: Key=%s, Type=%s, EventTime=%s, FirstProcessed=%s, Age=%v", 
+						eventKey, eventType, 
+						event.Date.Format("2006-01-02T15:04:05"),
+						processedTime.Format("2006-01-02T15:04:05"),
+						time.Since(processedTime))
+				}
+				continue
+			} else {
+				// CACHE MISS - it's a new event
+				eventCacheStats.CacheMisses++
+				localCacheMisses++
+			}
+		}
+		
+		// Apply existing filtering logic
+		if shouldProcessEvent(event, eventType, filter) {
+			filteredEvents = append(filteredEvents, event)
+		} else {
+			droppedCount++
+			if stats.EnableDetailedLogging {
+				log.Printf("🚫 Filtered event type %s (Key: %s)", eventType, eventKey)
+			}
+		}
+	}
+	
+	return filteredEvents, droppedCount, duplicateCount, localCacheHits, localCacheMisses
 }
 
 func min(a, b int) int {
