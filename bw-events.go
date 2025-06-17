@@ -220,6 +220,16 @@ var (
 	timeBasedMarker  = &TimeBasedMarker{}
 )
 
+// Updated global cache - index by BOTH userId AND orgMemberId
+var memberListCache struct {
+	sync.RWMutex
+	membersByUserId  map[string]map[string]interface{} // userId -> member data
+	membersByOrgId   map[string]map[string]interface{} // orgMemberID -> member data
+	lastUpdate       time.Time
+	ttl              time.Duration
+	missedLookups    map[string]time.Time              // Track failed lookups to trigger refresh
+}
+
 func main() {
 	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
@@ -286,6 +296,8 @@ func main() {
 	}
 
 	log.Printf("✅ Successfully authenticated (expires: %s)", currentToken.ExpiresAt.Format("2006-01-02 15:04:05"))
+
+	diagnoseUserMembership(config)
 
 	log.Println("💾 Cache initialized")
 	log.Printf("🗺️  Field mappings loaded (%d lookups)", len(fieldMapping.Lookups))
@@ -424,6 +436,107 @@ func validateConfig(config Configuration) error {
 		return fmt.Errorf("fetch interval must be at least 10 seconds")
 	}
 	return nil
+}
+
+func init() {
+	memberListCache.membersByUserId = make(map[string]map[string]interface{})
+	memberListCache.membersByOrgId = make(map[string]map[string]interface{})
+	memberListCache.missedLookups = make(map[string]time.Time)
+	memberListCache.ttl = 15 * time.Minute
+}
+
+// Diagnostic function to understand which users can be looked up
+func diagnoseUserMembership(config Configuration) {
+	log.Println("🔬 Diagnosing user membership and lookup capability...")
+	
+	// Get the organization member list
+	url := config.APIBaseURL + "/public/members"
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		log.Printf("❌ Error creating request: %v", err)
+		return
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+currentToken.AccessToken)
+	req.Header.Set("User-Agent", "Bitwarden-Event-Forwarder/2.0")
+	req.Header.Set("Accept", "application/json")
+	
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("❌ Request failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	body, _ := ioutil.ReadAll(resp.Body)
+	
+	if resp.StatusCode != 200 {
+		log.Printf("❌ Members list failed with status %d: %s", resp.StatusCode, string(body))
+		return
+	}
+	
+	var membersResponse map[string]interface{}
+	if err := json.Unmarshal(body, &membersResponse); err != nil {
+		log.Printf("❌ Error parsing response: %v", err)
+		return
+	}
+	
+	dataInterface, exists := membersResponse["data"]
+	if !exists {
+		log.Printf("❌ No 'data' field in response")
+		return
+	}
+	
+	members, ok := dataInterface.([]interface{})
+	if !ok {
+		log.Printf("❌ 'data' field is not an array")
+		return
+	}
+	
+	log.Printf("📊 Organization has %d members", len(members))
+	
+	// Create a map of organization userIds for quick lookup
+	orgUserIds := make(map[string]bool)
+	
+	log.Println("👥 Organization members:")
+	for i, memberInterface := range members {
+		if member, ok := memberInterface.(map[string]interface{}); ok {
+			id := "unknown"
+			userId := "unknown"
+			name := "unknown"
+			email := "unknown"
+			
+			if idVal, exists := member["id"]; exists {
+				id = fmt.Sprintf("%v", idVal)
+			}
+			if userIdVal, exists := member["userId"]; exists {
+				userId = fmt.Sprintf("%v", userIdVal)
+				orgUserIds[userId] = true
+			}
+			if nameVal, exists := member["name"]; exists && nameVal != nil {
+				name = fmt.Sprintf("%v", nameVal)
+			}
+			if emailVal, exists := member["email"]; exists {
+				email = fmt.Sprintf("%v", emailVal)
+			}
+			
+			log.Printf("   %d. OrgMemberID=%s, UserID=%s, Name=%s, Email=%s", 
+				i+1, id, userId, name, email)
+		}
+	}
+	
+	// Now let's analyze some recent events to see what actingUserIds we're getting
+	log.Println("🔍 Checking recent events for actingUserId patterns...")
+	
+	// This is a simplified version - you'd want to check your actual recent events
+	log.Printf("📋 Summary:")
+	log.Printf("   - Organization members who CAN be looked up: %d", len(orgUserIds))
+	log.Printf("   - Use this list to check if event actingUserIds are organization members")
+	log.Println("💡 Next step: Check if your event actingUserIds match any of the UserIDs above")
+	
+	return
 }
 
 func setupLogging(config Configuration) error {
@@ -1142,8 +1255,6 @@ func isServiceAccount(event BitwardenEvent) bool {
 	return false
 }
 
-// REPLACE your existing forwardEventsWithStats function with this version:
-
 func forwardEventsWithStats(events []BitwardenEvent, config Configuration, 
 	fieldMapping FieldMapping, syslogWriter *SyslogWriter) (int, int, CacheStats, LookupStats, ChangeStats, error) {
 	
@@ -1153,9 +1264,13 @@ func forwardEventsWithStats(events []BitwardenEvent, config Configuration,
 	var changeStats ChangeStats
 	
 	for _, event := range events {
-		// Declare eventKey at the beginning of the loop so it's available throughout
 		eventKey := getEventDeduplicationKey(event)
+		eventType := fmt.Sprintf("%d", event.Type)
 		
+		// Invalidate relevant caches for change events
+		invalidateCache(eventType, fieldMapping)
+		
+		// Enrich the event with lookup data
 		enrichedEvent, cacheHit, lookupSuccess := enrichEvent(event, fieldMapping, config)
 		
 		if cacheHit {
@@ -1170,11 +1285,13 @@ func forwardEventsWithStats(events []BitwardenEvent, config Configuration,
 			lookupStats.Success++
 		}
 		
+		// Format and send the event
 		cefMessage := formatEventAsCEF(enrichedEvent, config, fieldMapping)
 		syslogMessage := formatSyslogMessage("bitwarden-forwarder", cefMessage)
 		
 		if len(syslogMessage) > config.MaxMsgSize {
 			syslogMessage = syslogMessage[:config.MaxMsgSize]
+			log.Printf("⚠️ Truncated message for event %s due to size limit", eventKey)
 		}
 		
 		if err := syslogWriter.Write(syslogMessage); err != nil {
@@ -1190,31 +1307,373 @@ func forwardEventsWithStats(events []BitwardenEvent, config Configuration,
 			}
 		}
 		
-		// ONLY mark as processed AFTER successful forwarding
+		// Mark as processed only after successful forwarding
 		if eventCache != nil {
 			eventCache.MarkProcessed(eventKey)
-			log.Printf("✅ MARKED PROCESSED: Key=%s, Type=%s, EventTime=%s, ProcessedAt=%s", 
-				eventKey, fmt.Sprintf("%d", event.Type), 
-				event.Date.Format("2006-01-02T15:04:05"),
-				time.Now().Format("2006-01-02T15:04:05"))
+			if config.Verbose {
+				log.Printf("✅ Forwarded enriched event: Key=%s, Type=%s (%s), User=%s (%s)", 
+					eventKey, eventType, getStringValue(enrichedEvent, "eventTypeName"), 
+					getStringValue(enrichedEvent, "memberId"), 
+					getStringValue(enrichedEvent, "memberName"))
+			}
 		}
-			
+		
 		forwarded++
 	}
 	
 	return forwarded, dropped, cacheStats, lookupStats, changeStats, nil
 }
 
+func performMemberLookupFromList(lookupType, lookupId string, fieldMapping FieldMapping, config Configuration) (map[string]interface{}, bool, bool) {
+	// Step 1: Ensure we have a fresh member list
+	err := refreshMemberListCache(config)
+	if err != nil {
+		log.Printf("❌ Failed to refresh member list: %v", err)
+		return nil, false, false
+	}
+	
+	// Step 2: Determine which index to use based on lookup type
+	var memberData map[string]interface{}
+	var exists bool
+	
+	memberListCache.RLock()
+	if lookupType == "actingUserId" {
+		// actingUserId contains userId - look up by userId
+		memberData, exists = memberListCache.membersByUserId[lookupId]
+		if config.Verbose && exists {
+			log.Printf("🔗 Found user %s in organization member list", lookupId)
+		}
+	} else if lookupType == "memberId" {
+		// memberId contains organization member ID - look up by orgMemberId
+		memberData, exists = memberListCache.membersByOrgId[lookupId]
+		if config.Verbose && exists {
+			log.Printf("🔗 Found org member %s in member list", lookupId)
+		}
+	}
+	memberListCache.RUnlock()
+	
+	if !exists {
+		// Check if we've recently missed this lookup
+		memberListCache.RLock()
+		lastMiss, recentMiss := memberListCache.missedLookups[lookupId]
+		memberListCache.RUnlock()
+		
+		// If we haven't tried recently, force a cache refresh and retry ONCE
+		if !recentMiss || time.Since(lastMiss) > 2*time.Minute {
+			if config.Verbose {
+				log.Printf("🔄 %s ID %s not found, forcing cache refresh and retrying", lookupType, lookupId)
+			}
+			
+			// Force cache refresh
+			memberListCache.Lock()
+			memberListCache.lastUpdate = time.Time{} // Force refresh
+			memberListCache.missedLookups[lookupId] = time.Now()
+			memberListCache.Unlock()
+			
+			// Retry the refresh
+			err := refreshMemberListCache(config)
+			if err != nil {
+				log.Printf("❌ Failed to force-refresh member list: %v", err)
+				return nil, false, false
+			}
+			
+			// Try lookup again with correct index
+			memberListCache.RLock()
+			if lookupType == "actingUserId" {
+				memberData, exists = memberListCache.membersByUserId[lookupId]
+			} else if lookupType == "memberId" {
+				memberData, exists = memberListCache.membersByOrgId[lookupId]
+			}
+			memberListCache.RUnlock()
+		}
+		
+		if !exists {
+			if config.Verbose {
+				log.Printf("⚠️ %s ID %s not found in member list (even after refresh)", lookupType, lookupId)
+			}
+			return nil, false, false
+		}
+	}
+	
+	// Step 3: Map the member data according to field mapping config
+	lookupConfig, exists := fieldMapping.Lookups[lookupType]
+	if !exists {
+		return nil, false, false
+	}
+	
+	mappedData := mapResponseData(memberData, lookupConfig.ResponseMapping)
+	
+	// Cache the result using the original lookupId as key
+	lookupCache.Lock()
+	if lookupCache.data[lookupType] == nil {
+		lookupCache.data[lookupType] = make(map[string]interface{})
+	}
+	lookupCache.data[lookupType][lookupId] = mappedData
+	lookupCache.Unlock()
+	
+	// Clear any missed lookup tracking for this ID since it succeeded
+	memberListCache.Lock()
+	delete(memberListCache.missedLookups, lookupId)
+	memberListCache.Unlock()
+	
+	if config.Verbose {
+		log.Printf("✅ Successfully looked up %s %s: %s", 
+			lookupType, lookupId, getStringValue(mappedData, "userName"))
+	}
+	
+	return mappedData, false, true
+}
+
+func refreshMemberListCache(config Configuration) error {
+	memberListCache.Lock()
+	defer memberListCache.Unlock()
+	
+	// Check if cache is still valid
+	if time.Since(memberListCache.lastUpdate) < memberListCache.ttl {
+		return nil // Cache is still fresh
+	}
+	
+	// Fetch fresh member list
+	url := config.APIBaseURL + "/public/members"
+	
+	if config.Verbose {
+		log.Printf("🔄 Refreshing member list cache from: %s", url)
+	}
+	
+	data, success := makeBitwardenAPIRequest(url, config)
+	if !success {
+		return fmt.Errorf("failed to fetch member list")
+	}
+	
+	// Parse the response
+	dataInterface, exists := data["data"]
+	if !exists {
+		return fmt.Errorf("no 'data' field in member list response")
+	}
+	
+	members, ok := dataInterface.([]interface{})
+	if !ok {
+		return fmt.Errorf("'data' field is not an array")
+	}
+	
+	// Clear and rebuild both caches
+	oldUserCount := len(memberListCache.membersByUserId)
+	oldOrgCount := len(memberListCache.membersByOrgId)
+	memberListCache.membersByUserId = make(map[string]map[string]interface{})
+	memberListCache.membersByOrgId = make(map[string]map[string]interface{})
+	
+	for _, memberInterface := range members {
+		member, ok := memberInterface.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		
+		// Index by BOTH userId AND organization member ID
+		if userIdInterface, exists := member["userId"]; exists {
+			userId := fmt.Sprintf("%v", userIdInterface)
+			memberListCache.membersByUserId[userId] = member
+		}
+		
+		if idInterface, exists := member["id"]; exists {
+			orgMemberId := fmt.Sprintf("%v", idInterface)
+			memberListCache.membersByOrgId[orgMemberId] = member
+		}
+	}
+	
+	memberListCache.lastUpdate = time.Now()
+	
+	newUserCount := len(memberListCache.membersByUserId)
+	newOrgCount := len(memberListCache.membersByOrgId)
+	
+	if oldUserCount != newUserCount || oldOrgCount != newOrgCount {
+		log.Printf("📊 Member cache updated - by userId: %d -> %d, by orgId: %d -> %d", 
+			oldUserCount, newUserCount, oldOrgCount, newOrgCount)
+	}
+	
+	log.Printf("✅ Cached %d members by userId and %d by orgId for lookup", newUserCount, newOrgCount)
+	return nil
+}
+
+// Perform lookup with caching
+func performLookup(lookupType, id string, fieldMapping FieldMapping, config Configuration) (map[string]interface{}, bool, bool) {
+	// Check cache first for final result
+	lookupCache.RLock()
+	if cachedData, exists := lookupCache.data[lookupType]; exists {
+		if data, found := cachedData[id]; found {
+			lookupCache.RUnlock()
+			return data.(map[string]interface{}), true, true
+		}
+	}
+	lookupCache.RUnlock()
+	
+	// For member/user lookups, use the member list approach
+	if lookupType == "actingUserId" || lookupType == "memberId" {
+		return performMemberLookupFromList(lookupType, id, fieldMapping, config)
+	}
+	
+	// For other lookups (groups, collections, policies), use direct lookup
+	lookupConfig, exists := fieldMapping.Lookups[lookupType]
+	if !exists {
+		return nil, false, false
+	}
+	
+	endpoint := strings.Replace(lookupConfig.Endpoint, "{id}", id, -1)
+	url := config.APIBaseURL + endpoint
+	
+	if config.Verbose {
+		log.Printf("🔍 Direct lookup %s: %s", lookupType, url)
+	}
+	
+	data, success := makeBitwardenAPIRequest(url, config)
+	if success {
+		mappedData := mapResponseData(data, lookupConfig.ResponseMapping)
+		
+		// Cache the result
+		lookupCache.Lock()
+		if lookupCache.data[lookupType] == nil {
+			lookupCache.data[lookupType] = make(map[string]interface{})
+		}
+		lookupCache.data[lookupType][id] = mappedData
+		lookupCache.Unlock()
+		
+		return mappedData, false, true
+	}
+	
+	return nil, false, false
+}
+
+// Make authenticated API request to Bitwarden
+func makeBitwardenAPIRequest(url string, config Configuration) (map[string]interface{}, bool) {
+	// Ensure we have a valid token
+	if currentToken == nil || time.Now().After(currentToken.ExpiresAt.Add(-5*time.Minute)) {
+		if err := authenticateWithBitwarden(config); err != nil {
+			log.Printf("❌ Token refresh failed during lookup: %v", err)
+			return nil, false
+		}
+	}
+	
+	// Create the request
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		log.Printf("❌ Error creating lookup request: %v", err)
+		return nil, false
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+currentToken.AccessToken)
+	req.Header.Set("User-Agent", "Bitwarden-Event-Forwarder/2.0")
+	req.Header.Set("Accept", "application/json")
+	
+	// Make the request with timeout
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("❌ Lookup request failed: %v", err)
+		return nil, false
+	}
+	defer resp.Body.Close()
+	
+	// Handle different response codes
+	if resp.StatusCode == 404 {
+		// Resource not found - this is normal for deleted/removed items
+		log.Printf("ℹ️ Resource not found (404) for URL: %s", url)
+		return map[string]interface{}{"error": "not_found"}, true
+	}
+	
+	if resp.StatusCode != 200 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		log.Printf("❌ Lookup API returned status %d: %s", resp.StatusCode, string(body))
+		return nil, false
+	}
+	
+	// Parse the JSON response
+	var responseData map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&responseData); err != nil {
+		log.Printf("❌ Error parsing lookup response: %v", err)
+		return nil, false
+	}
+	
+	return responseData, true
+}
+
+// Map API response data according to field mapping configuration
+func mapResponseData(apiResponse map[string]interface{}, responseMapping map[string]string) map[string]interface{} {
+	mapped := make(map[string]interface{})
+	
+	// Apply explicit mappings from configuration
+	for apiField, outputField := range responseMapping {
+		if value, exists := apiResponse[apiField]; exists {
+			mapped[outputField] = value
+		}
+	}
+	
+	// Add some commonly useful fields directly if they exist
+	commonFields := []string{"id", "name", "email", "status", "type", "object"}
+	for _, field := range commonFields {
+		if value, exists := apiResponse[field]; exists {
+			// Only add if not already mapped
+			if _, alreadyMapped := mapped[field]; !alreadyMapped {
+				mapped[field] = value
+			}
+		}
+	}
+	
+	return mapped
+}
+
+// Cache invalidation function to handle cache cleanup when entities change
+func invalidateCache(eventType string, fieldMapping FieldMapping) {
+	if rules, exists := fieldMapping.CacheInvalidationRules[eventType]; exists {
+		lookupCache.Lock()
+		
+		// Track if we need to invalidate member list cache
+		needMemberListRefresh := false
+		
+		for _, cacheType := range rules {
+			if _, exists := lookupCache.data[cacheType]; exists {
+				// Clear entire cache for this type
+				delete(lookupCache.data, cacheType)
+				log.Printf("🧹 Invalidated cache for %s due to event type %s", cacheType, eventType)
+			}
+			
+			// Only invalidate member list cache for organization member changes
+			// NOT for actingUserId (which could be external users)
+			if cacheType == "memberId" {
+				needMemberListRefresh = true
+			}
+		}
+		lookupCache.Unlock()
+		
+		// Invalidate member list cache if needed
+		if needMemberListRefresh {
+			memberListCache.Lock()
+			memberListCache.lastUpdate = time.Time{} // Force refresh on next lookup
+			// Also clear missed lookups since we're refreshing
+			memberListCache.missedLookups = make(map[string]time.Time)
+			memberListCache.Unlock()
+			log.Printf("🧹 Invalidated member list cache due to event type %s", eventType)
+		}
+	}
+}
+
+// Helper function to safely get string values from enriched event data
+func getStringValue(data map[string]interface{}, key string) string {
+	if value, exists := data[key]; exists && value != nil {
+		return fmt.Sprintf("%v", value)
+	}
+	return ""
+}
+
 func enrichEvent(event BitwardenEvent, fieldMapping FieldMapping, config Configuration) (map[string]interface{}, bool, bool) {
 	eventKey := getEventDeduplicationKey(event)
 	enriched := map[string]interface{}{
 		"eventKey": eventKey,
-		"type":   event.Type,
-		"date":   event.Date.Format(time.RFC3339),
-		"device": event.Device,
-		"object": event.Object,
+		"type":     event.Type,
+		"date":     event.Date.Format(time.RFC3339),
+		"device":   event.Device,
+		"object":   event.Object,
 	}
 	
+	// Copy basic fields
 	if event.MemberID != nil {
 		enriched["memberId"] = *event.MemberID
 	}
@@ -1240,12 +1699,110 @@ func enrichEvent(event BitwardenEvent, fieldMapping FieldMapping, config Configu
 		enriched["ipAddress"] = *event.IPAddress
 	}
 	
+	// Add event type name
 	if eventName, exists := eventTypeMap[fmt.Sprintf("%d", event.Type)]; exists {
 		enriched["eventTypeName"] = eventName
 	}
 	enriched["deviceTypeName"] = getDeviceTypeName(event.Device)
 	
-	return enriched, true, true
+	// Perform lookups for GUIDs
+	cacheHit := true
+	lookupSuccess := true
+	
+	// PRIMARY: Lookup acting user information (this is the main user field)
+	if event.ActingUserID != nil {
+		userInfo, hit, success := performLookup("actingUserId", *event.ActingUserID, fieldMapping, config)
+		if success {
+			// Add the primary user information to the event
+			for key, value := range userInfo {
+				enriched[key] = value
+			}
+			// Keep original GUID for reference
+			enriched["userIdOriginal"] = *event.ActingUserID
+		}
+		if !hit {
+			cacheHit = false
+		}
+		if !success {
+			lookupSuccess = false
+			log.Printf("⚠️ Failed to lookup acting user ID: %s", *event.ActingUserID)
+		}
+	}
+	
+	// SECONDARY: Lookup member information (if different from acting user and populated)
+	if event.MemberID != nil && (event.ActingUserID == nil || *event.MemberID != *event.ActingUserID) {
+		memberInfo, hit, success := performLookup("memberId", *event.MemberID, fieldMapping, config)
+		if success {
+			// Add member info with prefix to distinguish from primary user
+			for key, value := range memberInfo {
+				enriched[key] = value  // This will use the memberName, memberEmail mappings
+			}
+			enriched["memberIdOriginal"] = *event.MemberID
+		}
+		if !hit {
+			cacheHit = false
+		}
+		if !success {
+			lookupSuccess = false
+			log.Printf("⚠️ Failed to lookup member ID: %s", *event.MemberID)
+		}
+	}
+	
+	// Lookup group information
+	if event.GroupID != nil {
+		groupInfo, hit, success := performLookup("groupId", *event.GroupID, fieldMapping, config)
+		if success {
+			for key, value := range groupInfo {
+				enriched[key] = value
+			}
+			enriched["groupIdOriginal"] = *event.GroupID
+		}
+		if !hit {
+			cacheHit = false
+		}
+		if !success {
+			lookupSuccess = false
+			log.Printf("⚠️ Failed to lookup group ID: %s", *event.GroupID)
+		}
+	}
+	
+	// Lookup collection information
+	if event.CollectionID != nil {
+		collectionInfo, hit, success := performLookup("collectionId", *event.CollectionID, fieldMapping, config)
+		if success {
+			for key, value := range collectionInfo {
+				enriched[key] = value
+			}
+			enriched["collectionIdOriginal"] = *event.CollectionID
+		}
+		if !hit {
+			cacheHit = false
+		}
+		if !success {
+			lookupSuccess = false
+			log.Printf("⚠️ Failed to lookup collection ID: %s", *event.CollectionID)
+		}
+	}
+	
+	// Lookup policy information
+	if event.PolicyID != nil {
+		policyInfo, hit, success := performLookup("policyId", *event.PolicyID, fieldMapping, config)
+		if success {
+			for key, value := range policyInfo {
+				enriched[key] = value
+			}
+			enriched["policyIdOriginal"] = *event.PolicyID
+		}
+		if !hit {
+			cacheHit = false
+		}
+		if !success {
+			lookupSuccess = false
+			log.Printf("⚠️ Failed to lookup policy ID: %s", *event.PolicyID)
+		}
+	}
+	
+	return enriched, cacheHit, lookupSuccess
 }
 
 func getDeviceTypeName(deviceType int) string {
@@ -1403,31 +1960,101 @@ func loadEventTypeMap(filename string) map[string]string {
 func createDefaultFieldMapping() FieldMapping {
 	return FieldMapping{
 		OrderedFields: []string{
-			"rt", "cs1", "cs2", "suser", "email", "status", "2fa", "host_ip",
-			"device", "groupId", "collectionId", "policyId", "actingUserId",
-			"objectname", "community", "roles", "caseName", "hasDataChanges",
-			"changeType", "changeCount", "changedFields", "oldValues", "newValues",
+			"rt", "cs1", "cs2", "suser", "email", "userName", "userEmail", "userStatus", 
+			"memberName", "memberEmail", "groupName", "collectionName", "policyName",
+			"status", "2fa", "host_ip", "device", "deviceTypeName", "groupId", "collectionId", "policyId", 
+			"memberId", "objectname", "eventTypeName", "userIdOriginal", "memberIdOriginal",
+			"groupIdOriginal", "collectionIdOriginal", "policyIdOriginal", "community", "roles", 
+			"caseName", "hasDataChanges", "changeType", "changeCount", "changedFields", "oldValues", "newValues",
 		},
 		FieldMappings: map[string]string{
-			"date": "rt", "type": "cs1", "id": "cs2", "memberId": "suser",
-			"actingUserId": "actingUserId", "ipAddress": "host_ip", "device": "device",
-			"groupId": "groupId", "collectionId": "collectionId", "policyId": "policyId", "object": "objectname",
+			"date":               "rt",
+			"type":               "cs1",
+			"eventKey":           "cs2",
+			"actingUserId":       "suser",        // Primary user field - the GUID that shows up
+			"userName":           "userName",     // Human-readable name from lookup
+			"userEmail":          "email",       // Human-readable email from lookup
+			"userStatus":         "status",      // User status from lookup
+			"user2FA":            "2fa",         // 2FA status from lookup
+			"memberId":           "memberId",    // Secondary field (often empty)
+			"memberName":         "memberName",  // Member name if different from acting user
+			"memberEmail":        "memberEmail", // Member email if different from acting user
+			"ipAddress":          "host_ip",
+			"device":             "device",
+			"deviceTypeName":     "deviceTypeName",
+			"groupId":            "groupId",
+			"groupName":          "groupName",
+			"collectionId":       "collectionId",
+			"collectionName":     "collectionName",
+			"policyId":           "policyId",
+			"policyName":         "policyName",
+			"object":             "objectname",
+			"eventTypeName":      "eventTypeName",
 		},
 		Lookups: map[string]LookupConfig{
-			"memberId": {
+			"actingUserId": {  // Changed from "memberId" to "actingUserId"
 				Endpoint: "/public/members/{id}",
 				ResponseMapping: map[string]string{
-					"name": "memberName", "email": "memberEmail", "status": "memberStatus",
-					"twoFactorEnabled": "member2FA", "type": "memberType", "accessAll": "memberAccessAll",
-					"externalId": "memberExternalId", "resetPasswordEnrolled": "memberResetPasswordEnrolled",
+					"name":                     "userName",     // Maps to primary user name
+					"email":                    "userEmail",    // Maps to primary user email
+					"status":                   "userStatus",   // Maps to primary user status
+					"twoFactorEnabled":         "user2FA",      // Maps to primary user 2FA
+					"type":                     "userType",
+					"accessAll":                "userAccessAll",
+					"externalId":               "userExternalId",
+					"resetPasswordEnrolled":    "userResetPasswordEnrolled",
+				},
+			},
+			"memberId": {  // Keep this for cases where memberId is populated separately
+				Endpoint: "/public/members/{id}",
+				ResponseMapping: map[string]string{
+					"name":                     "memberName",
+					"email":                    "memberEmail",
+					"status":                   "memberStatus",
+					"twoFactorEnabled":         "member2FA",
+					"type":                     "memberType",
+					"accessAll":                "memberAccessAll",
+					"externalId":               "memberExternalId",
+					"resetPasswordEnrolled":    "memberResetPasswordEnrolled",
+				},
+			},
+			"groupId": {
+				Endpoint: "/public/groups/{id}",
+				ResponseMapping: map[string]string{
+					"name":         "groupName",
+					"accessAll":    "groupAccessAll",
+					"externalId":   "groupExternalId",
+				},
+			},
+			"collectionId": {
+				Endpoint: "/public/collections/{id}",
+				ResponseMapping: map[string]string{
+					"name":         "collectionName",
+					"externalId":   "collectionExternalId",
+				},
+			},
+			"policyId": {
+				Endpoint: "/public/policies/{id}",
+				ResponseMapping: map[string]string{
+					"type":         "policyType",
+					"data":         "policyData",
+					"enabled":      "policyEnabled",
 				},
 			},
 		},
 		CacheInvalidationRules: map[string][]string{
-			"1700": {"policyId"}, "1500": {"memberId"}, "1501": {"memberId"}, "1502": {"memberId"},
-			"1503": {"memberId"}, "1504": {"memberId"}, "1505": {"memberId"},
-			"1400": {"groupId"}, "1401": {"groupId"}, "1402": {"groupId"},
-			"1300": {"collectionId"}, "1301": {"collectionId"}, "1302": {"collectionId"},
+			"1700": {"policyId"},
+			"1500": {"actingUserId", "memberId"},  // Added actingUserId
+			"1502": {"actingUserId", "memberId"},  // Added actingUserId
+			"1503": {"actingUserId", "memberId"},  // Added actingUserId
+			"1504": {"actingUserId", "memberId"},  // Added actingUserId
+			"1505": {"actingUserId", "memberId"},  // Added actingUserId
+			"1400": {"groupId"},
+			"1401": {"groupId"},
+			"1402": {"groupId"},
+			"1300": {"collectionId"},
+			"1301": {"collectionId"},
+			"1302": {"collectionId"},
 		},
 		EventFiltering: EventFilter{
 			Mode: "exclude",
