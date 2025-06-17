@@ -1,14 +1,15 @@
 {
     "ordered_fields": [
       "rt", "event_type", "subtype", "cs1", "cs2", "suser", "email", "userName", "userEmail", "userStatus", 
-      "memberName", "memberEmail", "groupName", "collectionName", "policyName",
-      "status", "2fa", "host_ip", "device", "deviceTypeName", "groupId", "collectionId", "policyId", 
-      "memberId", "objectname", "actingUserId", "userIdOriginal", "memberIdOriginal",
-      "groupIdOriginal", "collectionIdOriginal", "policyIdOriginal", "itemId", "installationId"
+      "memberName", "memberEmail", "groupName", "collectionName", "policyName", "policyType",
+      "status", "2fa", "host_ip", "device", "deviceTypeName", "objectname",
+      "actingUserIdOriginal", "memberIdOriginal", "groupIdOriginal", "collectionIdOriginal", 
+      "policyIdOriginal", "itemIdOriginal", "installationIdOriginal",
+      "userType", "memberType", "groupAccessAll", "policyEnabled"
     ],
     "field_mappings": {
       "date": "rt",
-      "type": "event_type",
+      "event_type": "event_type",
       "eventTypeName": "subtype", 
       "eventKey": "cs2",
       "actingUserId": "cs1",
@@ -16,26 +17,27 @@
       "userEmail": "suser",
       "userStatus": "status",
       "user2FA": "2fa",
-      "memberId": "memberId",
       "memberName": "memberName",
       "memberEmail": "email", 
       "ipAddress": "host_ip",
       "device": "device",
       "deviceTypeName": "deviceTypeName",
-      "groupId": "groupId",
       "groupName": "groupName",
-      "collectionId": "collectionId", 
       "collectionName": "collectionName",
-      "policyId": "policyId",
       "policyName": "policyName",
+      "policyType": "policyType",
       "object": "objectname",
-      "userIdOriginal": "userIdOriginal",
+      "actingUserIdOriginal": "actingUserIdOriginal",
       "memberIdOriginal": "memberIdOriginal",
       "groupIdOriginal": "groupIdOriginal",
       "collectionIdOriginal": "collectionIdOriginal",
       "policyIdOriginal": "policyIdOriginal",
-      "itemId": "itemId",
-      "installationId": "installationId"
+      "itemIdOriginal": "itemIdOriginal",
+      "installationIdOriginal": "installationIdOriginal",
+      "userType": "userType",
+      "memberType": "memberType",
+      "groupAccessAll": "groupAccessAll",
+      "policyEnabled": "policyEnabled"
     },
     "lookups": {
       "actingUserId": {
@@ -45,10 +47,7 @@
           "email": "userEmail",
           "status": "userStatus", 
           "twoFactorEnabled": "user2FA",
-          "type": "userType",
-          "accessAll": "userAccessAll",
-          "externalId": "userExternalId",
-          "resetPasswordEnrolled": "userResetPasswordEnrolled"
+          "type": "userType"
         }
       },
       "memberId": {
@@ -58,32 +57,26 @@
           "email": "memberEmail",
           "status": "memberStatus", 
           "twoFactorEnabled": "member2FA",
-          "type": "memberType",
-          "accessAll": "memberAccessAll",
-          "externalId": "memberExternalId",
-          "resetPasswordEnrolled": "memberResetPasswordEnrolled"
+          "type": "memberType"
         }
       },
       "groupId": {
         "endpoint": "/public/groups/{id}",
         "response_mapping": {
           "name": "groupName",
-          "accessAll": "groupAccessAll",
-          "externalId": "groupExternalId"
+          "accessAll": "groupAccessAll"
         }
       },
       "collectionId": {
         "endpoint": "/public/collections/{id}",
         "response_mapping": {
-          "name": "collectionName", 
-          "externalId": "collectionExternalId"
+          "name": "collectionName"
         }
       },
       "policyId": {
         "endpoint": "/public/policies/{id}",
         "response_mapping": {
           "type": "policyType",
-          "data": "policyData",
           "enabled": "policyEnabled"
         }
       }

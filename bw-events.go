@@ -140,7 +140,7 @@ type BitwardenEvent struct {
 	Object       string    `json:"object"`
 	Type         int       `json:"type"`
 	ItemID       *string   `json:"itemId"`
-	CollectionID *string   `json:"collectionId"`
+	CollectionID *string   `json:"collectionId,omitempty"`
 	GroupID      *string   `json:"groupId"`
 	PolicyID     *string   `json:"policyId"`
 	MemberID     *string   `json:"memberId"`
@@ -1664,142 +1664,136 @@ func getStringValue(data map[string]interface{}, key string) string {
 }
 
 func enrichEvent(event BitwardenEvent, fieldMapping FieldMapping, config Configuration) (map[string]interface{}, bool, bool) {
-	eventKey := getEventDeduplicationKey(event)
+	// CRITICAL: Preserve the original event type and structure FIRST
 	enriched := map[string]interface{}{
-		"eventKey": eventKey,
-		"type":     event.Type,
-		"date":     event.Date.Format(time.RFC3339),
-		"device":   event.Device,
-		"object":   event.Object,
+		"date":            event.Date.Format(time.RFC3339),
+		"event_type":      event.Type,    // Preserve original event type as event_type
+		"type":            event.Type,    // Also keep as type for mapping
+		"device":          event.Device,
+		"object":          event.Object,
+		"eventKey":        getEventDeduplicationKey(event),
 	}
 	
-	// Copy basic fields
-	if event.MemberID != nil {
-		enriched["memberId"] = *event.MemberID
-	}
+	// Copy all original IDs as-is for reference (late in mapping order)
 	if event.ActingUserID != nil {
 		enriched["actingUserId"] = *event.ActingUserID
+		enriched["actingUserIdOriginal"] = *event.ActingUserID  // Preserve original GUID
+	}
+	if event.MemberID != nil {
+		enriched["memberId"] = *event.MemberID
+		enriched["memberIdOriginal"] = *event.MemberID  // Preserve original GUID
 	}
 	if event.GroupID != nil {
 		enriched["groupId"] = *event.GroupID
+		enriched["groupIdOriginal"] = *event.GroupID  // Preserve original GUID
 	}
 	if event.CollectionID != nil {
 		enriched["collectionId"] = *event.CollectionID
+		enriched["collectionIdOriginal"] = *event.CollectionID  // Preserve original GUID
 	}
 	if event.PolicyID != nil {
 		enriched["policyId"] = *event.PolicyID
+		enriched["policyIdOriginal"] = *event.PolicyID  // Preserve original GUID
 	}
 	if event.ItemID != nil {
 		enriched["itemId"] = *event.ItemID
+		enriched["itemIdOriginal"] = *event.ItemID  // Preserve original GUID
 	}
 	if event.InstallationID != nil {
 		enriched["installationId"] = *event.InstallationID
+		enriched["installationIdOriginal"] = *event.InstallationID  // Preserve original GUID
 	}
 	if event.IPAddress != nil {
 		enriched["ipAddress"] = *event.IPAddress
 	}
 	
-	// Add event type name
+	// Add human-readable event type name
 	if eventName, exists := eventTypeMap[fmt.Sprintf("%d", event.Type)]; exists {
 		enriched["eventTypeName"] = eventName
+	} else {
+		enriched["eventTypeName"] = fmt.Sprintf("Unknown Event (%d)", event.Type)
 	}
+	
+	// Add device type name
 	enriched["deviceTypeName"] = getDeviceTypeName(event.Device)
 	
-	// Perform lookups for GUIDs
+	// NOW do lookups - but be careful about field name collisions
 	cacheHit := true
 	lookupSuccess := true
 	
-	// PRIMARY: Lookup acting user information (this is the main user field)
+	// Lookup acting user
 	if event.ActingUserID != nil {
 		userInfo, hit, success := performLookup("actingUserId", *event.ActingUserID, fieldMapping, config)
 		if success {
-			// Add the primary user information to the event
-			for key, value := range userInfo {
-				enriched[key] = value
-			}
-			// Keep original GUID for reference
-			enriched["userIdOriginal"] = *event.ActingUserID
+			// Add user info with SPECIFIC field names to avoid collision
+			enriched["userName"] = getStringValue(userInfo, "userName")
+			enriched["userEmail"] = getStringValue(userInfo, "userEmail")
+			enriched["userStatus"] = getStringValue(userInfo, "userStatus")
+			enriched["user2FA"] = getStringValue(userInfo, "user2FA")
+			// Store user type with prefixed name to avoid collision with event type
+			enriched["userType"] = getStringValue(userInfo, "userType")
 		}
-		if !hit {
-			cacheHit = false
-		}
-		if !success {
-			lookupSuccess = false
-			log.Printf("⚠️ Failed to lookup acting user ID: %s", *event.ActingUserID)
-		}
+		if !hit { cacheHit = false }
+		if !success { lookupSuccess = false }
 	}
 	
-	// SECONDARY: Lookup member information (if different from acting user and populated)
-	if event.MemberID != nil && (event.ActingUserID == nil || *event.MemberID != *event.ActingUserID) {
+	// Lookup member (if different from acting user)
+	if event.MemberID != nil {
 		memberInfo, hit, success := performLookup("memberId", *event.MemberID, fieldMapping, config)
 		if success {
-			// Add member info with prefix to distinguish from primary user
-			for key, value := range memberInfo {
-				enriched[key] = value  // This will use the memberName, memberEmail mappings
-			}
-			enriched["memberIdOriginal"] = *event.MemberID
+			// Add member info with SPECIFIC field names
+			enriched["memberName"] = getStringValue(memberInfo, "memberName")
+			enriched["memberEmail"] = getStringValue(memberInfo, "memberEmail")
+			enriched["memberStatus"] = getStringValue(memberInfo, "memberStatus")
+			enriched["member2FA"] = getStringValue(memberInfo, "member2FA")
+			// Store member type with prefixed name
+			enriched["memberType"] = getStringValue(memberInfo, "memberType")
 		}
-		if !hit {
-			cacheHit = false
-		}
-		if !success {
-			lookupSuccess = false
-			log.Printf("⚠️ Failed to lookup member ID: %s", *event.MemberID)
-		}
+		if !hit { cacheHit = false }
+		if !success { lookupSuccess = false }
 	}
 	
-	// Lookup group information
+	// Lookup group
 	if event.GroupID != nil {
 		groupInfo, hit, success := performLookup("groupId", *event.GroupID, fieldMapping, config)
 		if success {
-			for key, value := range groupInfo {
-				enriched[key] = value
-			}
-			enriched["groupIdOriginal"] = *event.GroupID
+			enriched["groupName"] = getStringValue(groupInfo, "groupName")
+			enriched["groupAccessAll"] = getStringValue(groupInfo, "groupAccessAll")
 		}
-		if !hit {
-			cacheHit = false
-		}
-		if !success {
-			lookupSuccess = false
-			log.Printf("⚠️ Failed to lookup group ID: %s", *event.GroupID)
-		}
+		if !hit { cacheHit = false }
+		if !success { lookupSuccess = false }
 	}
 	
-	// Lookup collection information
+	// Lookup collection
 	if event.CollectionID != nil {
 		collectionInfo, hit, success := performLookup("collectionId", *event.CollectionID, fieldMapping, config)
 		if success {
-			for key, value := range collectionInfo {
-				enriched[key] = value
-			}
-			enriched["collectionIdOriginal"] = *event.CollectionID
+			enriched["collectionName"] = getStringValue(collectionInfo, "collectionName")
 		}
-		if !hit {
-			cacheHit = false
-		}
-		if !success {
-			lookupSuccess = false
-			log.Printf("⚠️ Failed to lookup collection ID: %s", *event.CollectionID)
-		}
+		if !hit { cacheHit = false }
+		if !success { lookupSuccess = false }
 	}
 	
-	// Lookup policy information
+	// Lookup policy
 	if event.PolicyID != nil {
 		policyInfo, hit, success := performLookup("policyId", *event.PolicyID, fieldMapping, config)
 		if success {
-			for key, value := range policyInfo {
-				enriched[key] = value
-			}
-			enriched["policyIdOriginal"] = *event.PolicyID
+			enriched["policyName"] = getStringValue(policyInfo, "policyName")
+			// Store policy type with prefixed name to avoid collision
+			enriched["policyType"] = getStringValue(policyInfo, "policyType")
+			enriched["policyEnabled"] = getStringValue(policyInfo, "policyEnabled")
 		}
-		if !hit {
-			cacheHit = false
-		}
-		if !success {
-			lookupSuccess = false
-			log.Printf("⚠️ Failed to lookup policy ID: %s", *event.PolicyID)
-		}
+		if !hit { cacheHit = false }
+		if !success { lookupSuccess = false }
+	}
+	
+	// DOUBLE CHECK: Make sure original event type is preserved
+	enriched["event_type"] = event.Type
+	enriched["type"] = event.Type
+	
+	if config.Verbose {
+		log.Printf("🔍 Event preserved: original_type=%d, final_type=%v", 
+			event.Type, enriched["type"])
 	}
 	
 	return enriched, cacheHit, lookupSuccess
