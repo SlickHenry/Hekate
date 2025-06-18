@@ -2419,6 +2419,9 @@ func getDeviceTypeName(deviceType int) string {
 func formatEventAsCEF(event map[string]interface{}, config Configuration, fieldMapping FieldMapping) string {
 	eventType := fmt.Sprintf("%v", event["type"])
 	eventName := "Unknown Event"
+	if enrichedName, exists := event["eventTypeName"]; exists {
+        eventName = fmt.Sprintf("%v", enrichedName)
+    }
 	
 	if name, exists := eventTypeMap[eventType]; exists {
 		eventName = name
