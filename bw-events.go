@@ -55,6 +55,62 @@ type Configuration struct {
 	MaxEventsPerPoll     int
 }
 
+type JSONConfig struct {
+	BitwardenAPI BitwardenAPIConfig `json:"bitwarden_api"`
+	Syslog       SyslogConfig       `json:"syslog"`
+	Polling      PollingConfig      `json:"polling"`
+	Logging      LoggingConfig      `json:"logging"`
+	Files        FilesConfig        `json:"files"`
+	Monitoring   MonitoringConfig   `json:"monitoring"`
+	EventFilter  *EventFilter       `json:"event_filtering,omitempty"`
+	Statistics   *StatisticsConfig  `json:"statistics,omitempty"`
+}
+
+type BitwardenAPIConfig struct {
+	APIBaseURL   string `json:"api_base_url"`
+	IdentityURL  string `json:"identity_url"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+type SyslogConfig struct {
+	Server   string `json:"server"`
+	Port     string `json:"port"`
+	Protocol string `json:"protocol"`
+}
+
+type PollingConfig struct {
+	FetchInterval         int `json:"fetch_interval"`
+	ConnectionTimeout     int `json:"connection_timeout"`
+	MaxRetries           int `json:"max_retries"`
+	RetryDelay           int `json:"retry_delay"`
+	MaxBackoffDelay      int `json:"max_backoff_delay"`
+	InitialLookbackHours int `json:"initial_lookback_hours"`
+	PollOverlapMinutes   int `json:"poll_overlap_minutes"`
+	MaxEventsPerPoll     int `json:"max_events_per_poll"`
+}
+
+type LoggingConfig struct {
+	LogLevel string `json:"log_level"`
+	LogFile  string `json:"log_file"`
+	Verbose  bool   `json:"verbose"`
+}
+
+type FilesConfig struct {
+	MarkerFile    string `json:"marker_file"`
+	FieldMapFile  string `json:"field_map_file"`
+	EventMapFile  string `json:"event_map_file"`
+}
+
+type MonitoringConfig struct {
+	HealthCheckPort  int  `json:"health_check_port"`
+	EnableMetrics    bool `json:"enable_metrics"`
+	MaxMsgSize       int  `json:"max_msg_size"`
+	EventCacheSize   int  `json:"event_cache_size"`
+	EventCacheWindow int  `json:"event_cache_window"`
+	EnableEventCache bool `json:"enable_event_cache"`
+}
+
 type FieldMapping struct {
 	OrderedFields          []string                    `json:"ordered_fields"`
 	FieldMappings          map[string]string           `json:"field_mappings"`
@@ -230,11 +286,50 @@ var memberListCache struct {
 	missedLookups    map[string]time.Time              // Track failed lookups to trigger refresh
 }
 
+func printUsage() {
+	fmt.Println("Bitwarden Event Forwarder v2.0.0")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  bw-events [options]")
+	fmt.Println()
+	fmt.Println("Configuration:")
+	fmt.Println("  --config FILE              Load configuration from JSON file")
+	fmt.Println("  --generate-config FILE     Generate a sample configuration file")
+	fmt.Println("  --validate                 Validate configuration and exit")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  # Generate sample config")
+	fmt.Println("  ./bw-events --generate-config /etc/bitwarden/config.json")
+	fmt.Println()
+	fmt.Println("  # Validate config file")
+	fmt.Println("  ./bw-events --validate --config /etc/bitwarden/config.json")
+	fmt.Println()
+	fmt.Println("  # Run with config file")
+	fmt.Println("  ./bw-events --config /etc/bitwarden/config.json")
+	fmt.Println()
+	fmt.Println("  # Override config file settings with CLI args")
+	fmt.Println("  ./bw-events --config /etc/bitwarden/config.json --verbose --log-level debug")
+	fmt.Println()
+}
+
 func main() {
 	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 
 	config := loadConfig()
+
+	for i, arg := range os.Args[1:] {
+		if arg == "--generate-config" && i+1 < len(os.Args)-1 {
+			configPath := os.Args[i+2]
+			log.Printf("📋 Generating sample configuration file: %s", configPath)
+			if err := createSampleConfigFile(configPath); err != nil {
+				log.Fatalf("❌ Failed to generate config file: %v", err)
+			}
+			log.Printf("✅ Sample configuration file created: %s", configPath)
+			log.Println("📝 Please edit the file with your actual credentials and settings")
+			return
+		}
+	}
 
 	if config.ShowVersion {
 		fmt.Println("Bitwarden Event Forwarder v2.0.0 - Enhanced with Filtering & Statistics")
@@ -242,10 +337,26 @@ func main() {
 	}
 
 	if config.ValidateMode {
-		if err := validateConfig(config); err != nil {
-			log.Fatalf("❌ Configuration validation failed: %v", err)
+		// Check if we're validating a specific config file
+		configFileProvided := false
+		for i, arg := range os.Args[1:] {
+			if arg == "--config" && i+1 < len(os.Args)-1 {
+				configFilePath := os.Args[i+2]
+				if err := validateConfigFile(configFilePath); err != nil {
+					log.Fatalf("❌ Configuration file validation failed: %v", err)
+				}
+				configFileProvided = true
+				break
+			}
 		}
-		log.Println("✅ Configuration is valid")
+		
+		if !configFileProvided {
+			// Validate the current configuration
+			if err := validateConfig(config); err != nil {
+				log.Fatalf("❌ Configuration validation failed: %v", err)
+			}
+			log.Println("✅ Configuration is valid")
+		}
 		return
 	}
 
@@ -264,6 +375,16 @@ func main() {
 	logServiceStartup(config)
 
 	if err := validateConfig(config); err != nil {
+		log.Fatalf("❌ Configuration validation failed: %v", err)
+	}
+
+	// Add enhanced configuration logging
+	if config.Verbose {
+		logConfigurationSource(config)
+	}
+
+	// Use enhanced validation
+	if err := validateConfigWithWarnings(config); err != nil {
 		log.Fatalf("❌ Configuration validation failed: %v", err)
 	}
 
@@ -359,6 +480,7 @@ func loadConfig() Configuration {
 	identityURL := flag.String("identity-url", getEnvOrDefault("BW_IDENTITY_URL", "https://identity.bitwarden.com"), "Bitwarden Identity URL")
 	clientID := flag.String("client-id", getEnvOrDefault("BW_CLIENT_ID", ""), "Bitwarden API Client ID")
 	clientSecret := flag.String("client-secret", getEnvOrDefault("BW_CLIENT_SECRET", ""), "Bitwarden API Client Secret")
+	configFile := flag.String("config", getEnvOrDefault("CONFIG_FILE", ""), "Load configuration from JSON file")
 	syslogProto := flag.String("syslog-proto", getEnvOrDefault("SYSLOG_PROTOCOL", "tcp"), "Syslog protocol (tcp/udp)")
 	syslogServer := flag.String("syslog-server", getEnvOrDefault("SYSLOG_SERVER", "localhost"), "Syslog server address")
 	syslogPort := flag.String("syslog-port", getEnvOrDefault("SYSLOG_PORT", "514"), "Syslog server port")
@@ -369,6 +491,7 @@ func loadConfig() Configuration {
 	maxMsgSize := flag.Int("max-msg-size", getEnvOrIntDefault("MAX_MSG_SIZE", 8192), "Maximum syslog message size")
 	markerFile := flag.String("marker-file", getEnvOrDefault("MARKER_FILE", "bitwarden_marker.txt"), "Event marker file")
 	fieldMapFile := flag.String("field-map", getEnvOrDefault("FIELD_MAP_FILE", "bitwarden_field_map.json"), "Field mapping file")
+	generateConfig := flag.String("generate-config", "", "Generate a sample configuration file at the specified path")
 	eventMapFile := flag.String("event-map", getEnvOrDefault("EVENT_MAP_FILE", "bitwarden_event_map.json"), "Event type mapping file")
 	verbose := flag.Bool("verbose", getEnvOrBoolDefault("VERBOSE", false), "Enable verbose output")
 	maxRetries := flag.Int("max-retries", getEnvOrIntDefault("MAX_RETRIES", 3), "Maximum retry attempts")
@@ -383,32 +506,49 @@ func loadConfig() Configuration {
 	initialLookback := flag.Int("initial-lookback-hours", getEnvOrIntDefault("INITIAL_LOOKBACK_HOURS", 24), "Hours to look back for initial poll")
 	pollOverlap := flag.Int("poll-overlap-minutes", getEnvOrIntDefault("POLL_OVERLAP_MINUTES", 5), "Minutes to overlap between polls")
 	maxEvents := flag.Int("max-events-per-poll", getEnvOrIntDefault("MAX_EVENTS_PER_POLL", 1000), "Maximum events to fetch per poll")
+	help := flag.Bool("help", false, "Show help message")
 
 	flag.Parse()
 
-	return Configuration{
-		APIBaseURL:      *apiURL,
-		IdentityURL:     *identityURL,
-		ClientID:        *clientID,
-		ClientSecret:    *clientSecret,
-		SyslogProtocol:  *syslogProto,
-		SyslogServer:    *syslogServer,
-		SyslogPort:      *syslogPort,
-		LogLevel:        *logLevel,
-		LogFile:         *logFile,
-		FetchInterval:   *fetchInterval,
-		ConnTimeout:     *connTimeout,
-		MaxMsgSize:      *maxMsgSize,
-		MarkerFile:      *markerFile,
-		FieldMapFile:    *fieldMapFile,
-		EventMapFile:    *eventMapFile,
-		Verbose:         *verbose,
-		MaxRetries:      *maxRetries,
-		RetryDelay:      *retryDelay,
-		HealthCheckPort: *healthCheckPort,
-		TestMode:        *testMode,
-		ValidateMode:    *validateMode,
-		ShowVersion:     *showVersion,
+	if *help {
+		printUsage()
+		os.Exit(0)
+	}
+
+	if *generateConfig != "" {
+		log.Printf("📋 Generating sample configuration file: %s", *generateConfig)
+		if err := createSampleConfigFile(*generateConfig); err != nil {
+			log.Fatalf("❌ Failed to generate config file: %v", err)
+		}
+		log.Printf("✅ Sample configuration file created: %s", *generateConfig)
+		log.Println("📝 Please edit the file with your actual credentials and settings")
+		os.Exit(0)
+	}
+
+	// Start with defaults from command line and environment
+	config := Configuration{
+		APIBaseURL:           *apiURL,
+		IdentityURL:          *identityURL,
+		ClientID:             *clientID,
+		ClientSecret:         *clientSecret,
+		SyslogProtocol:       *syslogProto,
+		SyslogServer:         *syslogServer,
+		SyslogPort:           *syslogPort,
+		LogLevel:             *logLevel,
+		LogFile:              *logFile,
+		FetchInterval:        *fetchInterval,
+		ConnTimeout:          *connTimeout,
+		MaxMsgSize:           *maxMsgSize,
+		MarkerFile:           *markerFile,
+		FieldMapFile:         *fieldMapFile,
+		EventMapFile:         *eventMapFile,
+		Verbose:              *verbose,
+		MaxRetries:           *maxRetries,
+		RetryDelay:           *retryDelay,
+		HealthCheckPort:      *healthCheckPort,
+		TestMode:             *testMode,
+		ValidateMode:         *validateMode,
+		ShowVersion:          *showVersion,
 		EventCacheSize:       *eventCacheSize,
 		EventCacheWindow:     *eventCacheWindow,
 		EnableEventCache:     *enableEventCache,
@@ -416,10 +556,413 @@ func loadConfig() Configuration {
 		PollOverlapMinutes:   *pollOverlap,
 		MaxEventsPerPoll:     *maxEvents,
 	}
+
+	// Load from config file if specified
+	if *configFile != "" {
+		log.Printf("📋 Loading configuration from: %s", *configFile)
+		
+		if err := loadConfigFromFile(&config, *configFile); err != nil {
+			log.Fatalf("❌ Failed to load config file: %v", err)
+		}
+		
+		log.Printf("✅ Configuration loaded successfully from: %s", *configFile)
+		
+		// Command line arguments override config file values
+		if flag.Lookup("api-url").Value.String() != flag.Lookup("api-url").DefValue {
+			config.APIBaseURL = *apiURL
+		}
+		if flag.Lookup("identity-url").Value.String() != flag.Lookup("identity-url").DefValue {
+			config.IdentityURL = *identityURL
+		}
+		if flag.Lookup("client-id").Value.String() != flag.Lookup("client-id").DefValue {
+			config.ClientID = *clientID
+		}
+		if flag.Lookup("client-secret").Value.String() != flag.Lookup("client-secret").DefValue {
+			config.ClientSecret = *clientSecret
+		}
+		if flag.Lookup("syslog-proto").Value.String() != flag.Lookup("syslog-proto").DefValue {
+			config.SyslogProtocol = *syslogProto
+		}
+		if flag.Lookup("syslog-server").Value.String() != flag.Lookup("syslog-server").DefValue {
+			config.SyslogServer = *syslogServer
+		}
+		if flag.Lookup("syslog-port").Value.String() != flag.Lookup("syslog-port").DefValue {
+			config.SyslogPort = *syslogPort
+		}
+		if flag.Lookup("log-level").Value.String() != flag.Lookup("log-level").DefValue {
+			config.LogLevel = *logLevel
+		}
+		if flag.Lookup("log-file").Value.String() != flag.Lookup("log-file").DefValue {
+			config.LogFile = *logFile
+		}
+		if flag.Lookup("interval").Value.String() != flag.Lookup("interval").DefValue {
+			config.FetchInterval = *fetchInterval
+		}
+		if flag.Lookup("conn-timeout").Value.String() != flag.Lookup("conn-timeout").DefValue {
+			config.ConnTimeout = *connTimeout
+		}
+		if flag.Lookup("max-msg-size").Value.String() != flag.Lookup("max-msg-size").DefValue {
+			config.MaxMsgSize = *maxMsgSize
+		}
+		if flag.Lookup("marker-file").Value.String() != flag.Lookup("marker-file").DefValue {
+			config.MarkerFile = *markerFile
+		}
+		if flag.Lookup("field-map").Value.String() != flag.Lookup("field-map").DefValue {
+			config.FieldMapFile = *fieldMapFile
+		}
+		if flag.Lookup("event-map").Value.String() != flag.Lookup("event-map").DefValue {
+			config.EventMapFile = *eventMapFile
+		}
+		if flag.Lookup("verbose").Value.String() != flag.Lookup("verbose").DefValue {
+			config.Verbose = *verbose
+		}
+		if flag.Lookup("max-retries").Value.String() != flag.Lookup("max-retries").DefValue {
+			config.MaxRetries = *maxRetries
+		}
+		if flag.Lookup("retry-delay").Value.String() != flag.Lookup("retry-delay").DefValue {
+			config.RetryDelay = *retryDelay
+		}
+		if flag.Lookup("health-port").Value.String() != flag.Lookup("health-port").DefValue {
+			config.HealthCheckPort = *healthCheckPort
+		}
+		if flag.Lookup("event-cache-size").Value.String() != flag.Lookup("event-cache-size").DefValue {
+			config.EventCacheSize = *eventCacheSize
+		}
+		if flag.Lookup("event-cache-window").Value.String() != flag.Lookup("event-cache-window").DefValue {
+			config.EventCacheWindow = *eventCacheWindow
+		}
+		if flag.Lookup("enable-event-cache").Value.String() != flag.Lookup("enable-event-cache").DefValue {
+			config.EnableEventCache = *enableEventCache
+		}
+		if flag.Lookup("initial-lookback-hours").Value.String() != flag.Lookup("initial-lookback-hours").DefValue {
+			config.InitialLookbackHours = *initialLookback
+		}
+		if flag.Lookup("poll-overlap-minutes").Value.String() != flag.Lookup("poll-overlap-minutes").DefValue {
+			config.PollOverlapMinutes = *pollOverlap
+		}
+		if flag.Lookup("max-events-per-poll").Value.String() != flag.Lookup("max-events-per-poll").DefValue {
+			config.MaxEventsPerPoll = *maxEvents
+		}
+	}
+
+	return config
+}
+
+func getJSONErrorPosition(data []byte, offset int64) (line, col int) {
+	line = 1
+	col = 1
+	for i := int64(0); i < offset && i < int64(len(data)); i++ {
+		if data[i] == '\n' {
+			line++
+			col = 1
+		} else {
+			col++
+		}
+	}
+	return line, col
+}
+
+func loadConfigFromFile(config *Configuration, filename string) error {
+	// Check if file exists
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		return fmt.Errorf("config file does not exist: %s", filename)
+	}
+
+	// Resolve relative paths
+	absPath, err := filepath.Abs(filename)
+	if err != nil {
+		return fmt.Errorf("failed to resolve config file path '%s': %w", filename, err)
+	}
+
+	// Check if file exists and is readable
+	fileInfo, err := os.Stat(absPath)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("config file does not exist: %s", absPath)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot access config file '%s': %w", absPath, err)
+	}
+
+	// Check if it's a regular file
+	if !fileInfo.Mode().IsRegular() {
+		return fmt.Errorf("config file '%s' is not a regular file", absPath)
+	}
+
+	// Check file size (prevent loading huge files)
+	if fileInfo.Size() > 1024*1024 { // 1MB limit
+		return fmt.Errorf("config file '%s' is too large (%d bytes, max 1MB)", absPath, fileInfo.Size())
+	}
+
+	// Read file with better error context
+	data, err := ioutil.ReadFile(absPath)
+	if err != nil {
+		return fmt.Errorf("failed to read config file '%s': %w", absPath, err)
+	}
+
+	// Validate JSON before unmarshaling
+	if !json.Valid(data) {
+		return fmt.Errorf("config file '%s' contains invalid JSON", absPath)
+	}
+
+	// Parse JSON with detailed error reporting
+	var jsonConfig JSONConfig
+	if err := json.Unmarshal(data, &jsonConfig); err != nil {
+		// Try to provide line/column info for JSON errors
+		if syntaxErr, ok := err.(*json.SyntaxError); ok {
+			line, col := getJSONErrorPosition(data, syntaxErr.Offset)
+			return fmt.Errorf("JSON syntax error in config file '%s' at line %d, column %d: %w", 
+				absPath, line, col, err)
+		}
+		if typeErr, ok := err.(*json.UnmarshalTypeError); ok {
+			line, col := getJSONErrorPosition(data, typeErr.Offset)
+			return fmt.Errorf("JSON type error in config file '%s' at line %d, column %d, field '%s': expected %s but got %s", 
+				absPath, line, col, typeErr.Field, typeErr.Type, typeErr.Value)
+		}
+		return fmt.Errorf("failed to parse config file '%s': %w", absPath, err)
+	}
+
+	log.Printf("📋 Successfully loaded configuration from: %s", absPath)
+
+	// Apply configuration values from JSON file
+	// Only override if the JSON value is non-empty/non-zero
+	if jsonConfig.BitwardenAPI.APIBaseURL != "" {
+		config.APIBaseURL = jsonConfig.BitwardenAPI.APIBaseURL
+	}
+	if jsonConfig.BitwardenAPI.IdentityURL != "" {
+		config.IdentityURL = jsonConfig.BitwardenAPI.IdentityURL
+	}
+	if jsonConfig.BitwardenAPI.ClientID != "" {
+		config.ClientID = jsonConfig.BitwardenAPI.ClientID
+	}
+	if jsonConfig.BitwardenAPI.ClientSecret != "" {
+		config.ClientSecret = jsonConfig.BitwardenAPI.ClientSecret
+	}
+	if jsonConfig.Syslog.Server != "" {
+		config.SyslogServer = jsonConfig.Syslog.Server
+	}
+	if jsonConfig.Syslog.Port != "" {
+		config.SyslogPort = jsonConfig.Syslog.Port
+	}
+	if jsonConfig.Syslog.Protocol != "" {
+		config.SyslogProtocol = jsonConfig.Syslog.Protocol
+	}
+	if jsonConfig.Polling.FetchInterval > 0 {
+		config.FetchInterval = jsonConfig.Polling.FetchInterval
+	}
+	if jsonConfig.Polling.ConnectionTimeout > 0 {
+		config.ConnTimeout = jsonConfig.Polling.ConnectionTimeout
+	}
+	if jsonConfig.Polling.MaxRetries > 0 {
+		config.MaxRetries = jsonConfig.Polling.MaxRetries
+	}
+	if jsonConfig.Polling.RetryDelay > 0 {
+		config.RetryDelay = jsonConfig.Polling.RetryDelay
+	}
+	if jsonConfig.Polling.InitialLookbackHours > 0 {
+		config.InitialLookbackHours = jsonConfig.Polling.InitialLookbackHours
+	}
+	if jsonConfig.Polling.PollOverlapMinutes > 0 {
+		config.PollOverlapMinutes = jsonConfig.Polling.PollOverlapMinutes
+	}
+	if jsonConfig.Polling.MaxEventsPerPoll > 0 {
+		config.MaxEventsPerPoll = jsonConfig.Polling.MaxEventsPerPoll
+	}
+	if jsonConfig.Logging.LogLevel != "" {
+		config.LogLevel = jsonConfig.Logging.LogLevel
+	}
+	if jsonConfig.Logging.LogFile != "" {
+		config.LogFile = jsonConfig.Logging.LogFile
+	}
+	config.Verbose = jsonConfig.Logging.Verbose
+
+	if jsonConfig.Files.MarkerFile != "" {
+		config.MarkerFile = jsonConfig.Files.MarkerFile
+	}
+	if jsonConfig.Files.FieldMapFile != "" {
+		config.FieldMapFile = jsonConfig.Files.FieldMapFile
+	}
+	if jsonConfig.Files.EventMapFile != "" {
+		config.EventMapFile = jsonConfig.Files.EventMapFile
+	}
+	if jsonConfig.Monitoring.HealthCheckPort > 0 {
+		config.HealthCheckPort = jsonConfig.Monitoring.HealthCheckPort
+	}
+	if jsonConfig.Monitoring.MaxMsgSize > 0 {
+		config.MaxMsgSize = jsonConfig.Monitoring.MaxMsgSize
+	}
+	if jsonConfig.Monitoring.EventCacheSize > 0 {
+		config.EventCacheSize = jsonConfig.Monitoring.EventCacheSize
+	}
+	if jsonConfig.Monitoring.EventCacheWindow > 0 {
+		config.EventCacheWindow = jsonConfig.Monitoring.EventCacheWindow
+	}
+	config.EnableEventCache = jsonConfig.Monitoring.EnableEventCache
+
+	return nil
+}
+
+// ADD better logging for configuration loading
+func logConfigurationSource(config Configuration) {
+	log.Printf("📋 Configuration Summary:")
+	log.Printf("  📡 Syslog: %s:%s (%s)", config.SyslogServer, config.SyslogPort, config.SyslogProtocol)
+	log.Printf("  ⏱️  Poll Interval: %ds", config.FetchInterval)
+	log.Printf("  🔄 Max Retries: %d", config.MaxRetries)
+	log.Printf("  🏥 Health Port: %d", config.HealthCheckPort)
+	log.Printf("  📝 Log Level: %s", config.LogLevel)
+	if config.LogFile != "" {
+		log.Printf("  📁 Log File: %s", config.LogFile)
+	}
+	log.Printf("  🧠 Event Cache: %v (size: %d, window: %ds)", 
+		config.EnableEventCache, config.EventCacheSize, config.EventCacheWindow)
+}
+
+// ADD configuration validation with warnings
+func validateConfigWithWarnings(config Configuration) error {
+	// Critical validation (these will cause errors)
+	if err := validateConfig(config); err != nil {
+		return err
+	}
+
+	// Warnings for suboptimal configurations
+	warnings := []string{}
+
+	if config.FetchInterval < 30 {
+		warnings = append(warnings, 
+			fmt.Sprintf("fetch interval of %ds is quite aggressive, consider >= 30s for production", 
+			config.FetchInterval))
+	}
+
+	if config.MaxEventsPerPoll > 5000 {
+		warnings = append(warnings, 
+			fmt.Sprintf("max events per poll (%d) is very high, may cause memory issues", 
+			config.MaxEventsPerPoll))
+	}
+
+	if config.EventCacheSize > 50000 {
+		warnings = append(warnings, 
+			fmt.Sprintf("event cache size (%d) is very large, may use significant memory", 
+			config.EventCacheSize))
+	}
+
+	if config.SyslogProtocol == "udp" {
+		warnings = append(warnings, 
+			"UDP syslog protocol may lose messages under high load, consider TCP")
+	}
+
+	if config.InitialLookbackHours > 168 { // 1 week
+		warnings = append(warnings, 
+			fmt.Sprintf("initial lookback of %d hours is very long, may cause high initial load", 
+			config.InitialLookbackHours))
+	}
+
+	// Log warnings
+	for _, warning := range warnings {
+		log.Printf("⚠️  Warning: %s", warning)
+	}
+
+	return nil
+}
+
+func createSampleConfigFile(filename string) error {
+	sampleConfig := JSONConfig{
+		BitwardenAPI: BitwardenAPIConfig{
+			APIBaseURL:   "https://api.bitwarden.com",
+			IdentityURL:  "https://identity.bitwarden.com",
+			ClientID:     "your_client_id_from_bitwarden_portal",
+			ClientSecret: "your_client_secret_from_bitwarden_portal",
+		},
+		Syslog: SyslogConfig{
+			Server:   "your.syslog.server.com",
+			Port:     "514",
+			Protocol: "tcp",
+		},
+		Polling: PollingConfig{
+			FetchInterval:         60,
+			ConnectionTimeout:     30,
+			MaxRetries:           3,
+			RetryDelay:           5,
+			MaxBackoffDelay:      300,
+			InitialLookbackHours: 24,
+			PollOverlapMinutes:   5,
+			MaxEventsPerPoll:     1000,
+		},
+		Logging: LoggingConfig{
+			LogLevel: "info",
+			LogFile:  "/var/log/bitwarden-events.log",
+			Verbose:  false,
+		},
+		Files: FilesConfig{
+			MarkerFile:   "/var/lib/bitwarden/marker.txt",
+			FieldMapFile: "/etc/bitwarden/bitwarden_field_map.json",
+			EventMapFile: "/etc/bitwarden/bitwarden_event_map.json",
+		},
+		Monitoring: MonitoringConfig{
+			HealthCheckPort:  8080,
+			EnableMetrics:    true,
+			MaxMsgSize:       8192,
+			EventCacheSize:   10000,
+			EventCacheWindow: 3600,
+			EnableEventCache: true,
+		},
+	}
+
+	data, err := json.MarshalIndent(sampleConfig, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal sample config: %w", err)
+	}
+
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory for config file: %w", err)
+	}
+
+	return ioutil.WriteFile(filename, data, 0644)
+}
+
+func validateConfigFile(filename string) error {
+	log.Printf("🔍 Validating configuration file: %s", filename)
+	
+	// Check if file exists
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		return fmt.Errorf("config file does not exist: %s", filename)
+	}
+		
+	// Create a temporary configuration to test loading
+	tempConfig := Configuration{
+		APIBaseURL:           "https://api.bitwarden.com",
+		IdentityURL:          "https://identity.bitwarden.com",
+		SyslogProtocol:       "tcp",
+		SyslogServer:         "localhost",
+		SyslogPort:           "514",
+		LogLevel:             "info",
+		FetchInterval:        60,
+		ConnTimeout:          30,
+		MaxMsgSize:           8192,
+		MaxRetries:           3,
+		RetryDelay:           5,
+		HealthCheckPort:      8080,
+		EventCacheSize:       10000,
+		EventCacheWindow:     3600,
+		EnableEventCache:     true,
+		InitialLookbackHours: 24,
+		PollOverlapMinutes:   5,
+		MaxEventsPerPoll:     1000,
+	}
+
+	// Try to load the configuration
+	if err := loadConfigFromFile(&tempConfig, filename); err != nil {
+		return fmt.Errorf("failed to load config file: %w", err)
+	}
+
+	log.Printf("✅ Configuration file is valid: %s", filename)
+	return nil
 }
 
 func validateConfig(config Configuration) error {
-	missing := []string{}
+	var missing []string
+	var errors []string
+
+	// Required fields
 	if config.ClientID == "" {
 		missing = append(missing, "BW_CLIENT_ID")
 	}
@@ -429,12 +972,68 @@ func validateConfig(config Configuration) error {
 	if config.SyslogServer == "" {
 		missing = append(missing, "SYSLOG_SERVER")
 	}
+
 	if len(missing) > 0 {
-		return fmt.Errorf("missing required configuration: %v", missing)
+		errors = append(errors, fmt.Sprintf("missing required configuration: %v", missing))
 	}
+
+	// Validation rules
 	if config.FetchInterval < 10 {
-		return fmt.Errorf("fetch interval must be at least 10 seconds")
+		errors = append(errors, "fetch interval must be at least 10 seconds")
 	}
+	if config.ConnTimeout < 5 {
+		errors = append(errors, "connection timeout must be at least 5 seconds")
+	}
+	if config.MaxRetries < 0 {
+		errors = append(errors, "max retries must be 0 or greater")
+	}
+	if config.RetryDelay < 1 {
+		errors = append(errors, "retry delay must be at least 1 second")
+	}
+	if config.MaxMsgSize < 512 {
+		errors = append(errors, "max message size must be at least 512 bytes")
+	}
+	if config.HealthCheckPort < 0 || config.HealthCheckPort > 65535 {
+		errors = append(errors, "health check port must be between 0 and 65535")
+	}
+	if config.EventCacheSize < 0 {
+		errors = append(errors, "event cache size must be 0 or greater")
+	}
+	if config.EventCacheWindow < 0 {
+		errors = append(errors, "event cache window must be 0 or greater")
+	}
+	if config.InitialLookbackHours < 1 {
+		errors = append(errors, "initial lookback hours must be at least 1")
+	}
+	if config.PollOverlapMinutes < 0 {
+		errors = append(errors, "poll overlap minutes must be 0 or greater")
+	}
+	if config.MaxEventsPerPoll < 1 {
+		errors = append(errors, "max events per poll must be at least 1")
+	}
+
+	// Protocol validation
+	if config.SyslogProtocol != "tcp" && config.SyslogProtocol != "udp" {
+		errors = append(errors, "syslog protocol must be 'tcp' or 'udp'")
+	}
+
+	// Log level validation
+	validLogLevels := []string{"debug", "info", "warn", "error"}
+	isValidLogLevel := false
+	for _, level := range validLogLevels {
+		if config.LogLevel == level {
+			isValidLogLevel = true
+			break
+		}
+	}
+	if !isValidLogLevel {
+		errors = append(errors, fmt.Sprintf("log level must be one of: %v", validLogLevels))
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("configuration validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+
 	return nil
 }
 
@@ -759,6 +1358,7 @@ func testBitwardenAPI(config Configuration) error {
 }
 
 func testConfigFiles(config Configuration) error {
+	// Test field mapping file
 	if _, err := os.Stat(config.FieldMapFile); os.IsNotExist(err) {
 		defaultMapping := createDefaultFieldMapping()
 		if err := saveFieldMapping(config.FieldMapFile, defaultMapping); err != nil {
@@ -767,6 +1367,7 @@ func testConfigFiles(config Configuration) error {
 		log.Printf("📋 Created default field mapping file: %s", config.FieldMapFile)
 	}
 
+	// Test event mapping file
 	if _, err := os.Stat(config.EventMapFile); os.IsNotExist(err) {
 		return fmt.Errorf("event mapping file not found: %s (please provide bitwarden_event_map.json)", config.EventMapFile)
 	}
